@@ -1,0 +1,34 @@
+# deps
+node_modules/
+.pnpm-store/
+dist/
+build/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# env
+.env
+.env.local
+
+# os
+.DS_Store
+Thumbs.db
+
+# vite / next
+.web/
+
+# python
+*.egg-info/
+
+# logs
+logs/
+*.log
+
+# docker
+postgres_data/
+
+# turbo
+.turbo/
