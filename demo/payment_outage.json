@@ -1,0 +1,45 @@
+{
+  "incident": {
+    "id": "payment-001",
+    "title": "Payment checkout outage — error rate spike",
+    "severity": "SEV1",
+    "description": "Checkout error rate 12% since 14:02 UTC. Demo fixture for extraction + conflict + overdue + gap verification.",
+    "createdAt": "2026-09-02T14:00:00Z"
+  },
+  "participants": [
+    { "id": "p-priya", "name": "Priya", "role": "SRE", "joinedAt": "2026-09-02T14:00:00Z" },
+    { "id": "p-alex", "name": "Alex", "role": "Backend", "joinedAt": "2026-09-02T14:00:05Z" },
+    { "id": "p-jordan", "name": "Jordan", "role": "Support", "joinedAt": "2026-09-02T14:00:10Z" },
+    { "id": "p-maya", "name": "Maya", "role": "Comms", "joinedAt": "2026-09-02T14:01:00Z" }
+  ],
+  "utterances": [
+    { "id": "u-001", "speakerId": "p-priya", "speakerName": "Priya", "role": "SRE", "text": "I am Priya, SRE Lead. Payments are failing hard — error rate spiked to 12% at checkout since 14:02 UTC.", "startMs": 0, "endMs": 4500, "isFinal": true },
+    { "id": "u-002", "speakerId": "p-alex", "speakerName": "Alex", "role": "Backend", "text": "Copy, I checked Datadog — DB replica lag on payments-db-03 is 45 seconds.", "startMs": 5000, "endMs": 8000, "isFinal": true },
+    { "id": "u-003", "speakerId": "p-priya", "speakerName": "Priya", "role": "SRE", "text": "Confirmed — I see the same lag on my dashboard, and checkout 5xx count is 340 in last 5 minutes.", "startMs": 8500, "endMs": 12000, "isFinal": true },
+    { "id": "u-004", "speakerId": "p-alex", "speakerName": "Alex", "role": "Backend", "text": "I think it's a recent deploy that caused this — maybe the retry logic merged at 13:40?", "startMs": 12500, "endMs": 15000, "isFinal": true },
+    { "id": "u-005", "speakerId": "p-jordan", "speakerName": "Jordan", "role": "Support", "text": "Support is getting flooded — 80 tickets in 10 minutes, all payment failures. Users retrying makes it worse.", "startMs": 15500, "endMs": 18500, "isFinal": true },
+    { "id": "u-006", "speakerId": "p-maya", "speakerName": "Maya", "role": "Comms", "text": "Comms here — should we send a status page update? Customers are asking on Twitter.", "startMs": 19000, "endMs": 21000, "isFinal": true },
+    { "id": "u-007", "speakerId": "p-priya", "speakerName": "Priya", "role": "SRE", "text": "Let's rollback the payment service to v2.14.3 — that rev reverts the retry change.", "startMs": 21500, "endMs": 24000, "isFinal": true },
+    { "id": "u-008", "speakerId": "p-alex", "speakerName": "Alex", "role": "Backend", "text": "But wait — error rate just dropped to 2% on my screen at 14:06. Maybe the LB auto-scaled?", "startMs": 24500, "endMs": 27500, "isFinal": true },
+    { "id": "u-009", "speakerId": "p-priya", "speakerName": "Priya", "role": "SRE", "text": "Conflicting — I still see 12% at 14:06. Alex, what time window are you looking at?", "startMs": 28000, "endMs": 30500, "isFinal": true },
+    { "id": "u-010", "speakerId": "p-alex", "speakerName": "Alex", "role": "Backend", "text": "Can someone create a Jira to track the DB replica fix? Assign to Backend, due in 30 minutes.", "startMs": 31000, "endMs": 33500, "isFinal": true },
+    { "id": "u-011", "speakerId": "p-priya", "speakerName": "Priya", "role": "SRE", "text": "Do it — but require approval before it posts to Jira. We'll confirm after rollback.", "startMs": 34000, "endMs": 36000, "isFinal": true },
+    { "id": "u-012", "speakerId": "p-jordan", "speakerName": "Jordan", "role": "Support", "text": "We need an owner for customer comms — I can't do it, I'm on tickets.", "startMs": 36500, "endMs": 38500, "isFinal": true }
+  ],
+  "expectedExtractions": {
+    "facts": 4,
+    "hypotheses": 1,
+    "decisions": 1,
+    "actionItems": 2,
+    "conflicts": 1,
+    "gaps": [
+      { "kind": "ConflictingInfo", "message": "error rate 2% vs 12% at 14:06" },
+      { "kind": "MissingOwner", "message": "customer comms has no owner" },
+      { "kind": "UnverifiedAssumption", "message": "deploy retry logic caused outage (hypothesis not confirmed)" }
+    ],
+    "overdueActionTitle": "Fix DB replica lag on payments-db-03",
+    "requiresConfirmationAction": true,
+    "timelineMinLength": 12
+  },
+  "transcriptReplayRate": "1.5x"
+}
