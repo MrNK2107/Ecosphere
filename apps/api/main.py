@@ -1,0 +1,1369 @@
+"""
+Agora API — FastAPI backend with Postgres persistence (SQLAlchemy async).
+Implements: incidents CRUD, transcript ingestion + cognition, snapshot, WS timeline, actions, summary.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Any, Optional, Literal, Dict, List, Set
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body, Path, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import select, func, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .models import (
+    Base, IncidentModel, ParticipantModel, TranscriptSegmentModel,
+    FactModel, HypothesisModel, DecisionModel, ActionItemModel,
+    GapModel, TimelineEventModel, ToolEventModel, TimelineSeqModel,
+)
+from .db import get_engine, init_db, close_db, get_db
+
+logger = logging.getLogger("agora.api")
+logging.basicConfig(level=logging.INFO)
+
+# ---------------------------------------------------------------------------
+# Shared types — import from package, fallback to inline
+# ---------------------------------------------------------------------------
+try:
+    from agora_shared.types import (
+        Participant as SharedParticipant,
+        TranscriptSegment as SharedTranscriptSegment,
+        Fact as SharedFact,
+        Hypothesis as SharedHypothesis,
+        Decision as SharedDecision,
+        ActionItem as SharedActionItem,
+        Gap as SharedGap,
+        ToolEvent as SharedToolEvent,
+        TimelineEvent as SharedTimelineEvent,
+        Incident as SharedIncident,
+        IncidentSnapshot as SharedSnapshot,
+    )
+    HAS_SHARED = True
+except Exception:
+    HAS_SHARED = False
+
+# ---------------------------------------------------------------------------
+# Pydantic models (API request/response validators)
+# ---------------------------------------------------------------------------
+model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+FactStatus = Literal["Confirmed", "Corroborated", "Reported", "Contradicted"]
+HypothesisStatus = Literal["Active", "Disproven", "Confirmed"]
+DecisionStatus = Literal["Proposed", "Approved", "Reverted"]
+ActionStatus = Literal["Open", "InProgress", "Blocked", "Done", "Overdue"]
+GapKind = Literal["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction"]
+TimelineEventType = Literal[
+    "transcript", "fact_created", "fact_updated",
+    "hypothesis_created", "hypothesis_updated",
+    "decision", "action_created", "action_updated",
+    "gap_detected", "gap_resolved", "tool", "summary", "system"
+]
+ToolName = Literal["jira", "slack", "pagerduty", "datadog", "github"]
+ToolEventStatus = Literal["pending", "success", "failed", "requiresApproval", "rejected"]
+IncidentStatus = Literal["open", "investigating", "mitigated", "resolved", "closed"]
+ParticipantRole = Literal["SRE", "Backend", "Frontend", "Support", "Biz", "Comms", "Unknown"]
+
+
+class Participant(BaseModel):
+    model_config = model_config
+    id: str
+    name: str
+    role: ParticipantRole = "Unknown"
+    avatarUrl: Optional[str] = None
+    joinedAt: datetime
+    isBot: bool = False
+
+
+class TranscriptSegment(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    speakerId: Optional[str] = None
+    speakerName: Optional[str] = None
+    role: Optional[ParticipantRole] = None
+    text: str
+    isFinal: bool = True
+    startMs: int = Field(ge=0)
+    endMs: int = Field(ge=0)
+    confidence: float = Field(ge=0, le=1, default=0.9)
+    language: str = "en-US"
+    createdAt: datetime
+
+
+class Fact(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    statement: str
+    status: FactStatus
+    confidence: float = Field(ge=0, le=1)
+    sourceSegmentIds: list[str] = Field(min_length=1)
+    createdAt: datetime
+    updatedAt: datetime
+    createdBy: Optional[str] = None
+
+
+class Hypothesis(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    statement: str
+    status: HypothesisStatus
+    confidence: float = Field(ge=0, le=1)
+    sourceSegmentIds: list[str] = Field(default_factory=list)
+    createdAt: datetime
+    updatedAt: datetime
+    disprovenReason: Optional[str] = None
+
+
+class Decision(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    statement: str
+    status: DecisionStatus
+    decidedBy: Optional[str] = None
+    decidedAt: Optional[datetime] = None
+    sourceSegmentIds: list[str] = Field(default_factory=list)
+    createdAt: datetime
+    updatedAt: datetime
+
+
+class ActionItem(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    title: str
+    description: Optional[str] = None
+    ownerId: Optional[str] = None
+    ownerName: Optional[str] = None
+    status: ActionStatus
+    requiresConfirmation: bool = False
+    dueAt: Optional[datetime] = None
+    createdAt: datetime
+    updatedAt: datetime
+    sourceSegmentIds: list[str] = Field(default_factory=list)
+    toolKey: Optional[ToolName] = None
+    toolPayload: Optional[dict[str, Any]] = None
+
+
+class Gap(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    kind: GapKind
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    message: str
+    relatedIds: list[str] = Field(default_factory=list)
+    createdAt: datetime
+    resolvedAt: Optional[datetime] = None
+
+
+class ToolEvent(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    tool: ToolName
+    action: str
+    status: ToolEventStatus
+    payload: dict[str, Any] = Field(default_factory=dict)
+    result: Optional[dict[str, Any]] = None
+    requiresApproval: bool = False
+    actionItemId: Optional[str] = None
+    createdAt: datetime
+
+
+class TimelineEvent(BaseModel):
+    model_config = model_config
+    id: str
+    incidentId: str
+    type: TimelineEventType
+    seq: int = Field(ge=0)
+    createdAt: datetime
+    actorId: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    refId: Optional[str] = None
+
+
+class Incident(BaseModel):
+    model_config = model_config
+    id: str
+    title: str
+    description: Optional[str] = None
+    status: IncidentStatus = "open"
+    severity: Literal["SEV1", "SEV2", "SEV3", "SEV4"] = "SEV1"
+    createdAt: datetime
+    updatedAt: datetime
+    participants: list[Participant] = Field(default_factory=list)
+    summaryMarkdown: Optional[str] = None
+
+
+class IncidentSnapshot(BaseModel):
+    model_config = model_config
+    incident: Incident
+    facts: list[Fact] = Field(default_factory=list)
+    hypotheses: list[Hypothesis] = Field(default_factory=list)
+    decisions: list[Decision] = Field(default_factory=list)
+    actions: list[ActionItem] = Field(default_factory=list)
+    gaps: list[Gap] = Field(default_factory=list)
+    timeline: list[TimelineEvent] = Field(default_factory=list)
+    transcript: list[TranscriptSegment] = Field(default_factory=list)
+    toolEvents: list[ToolEvent] = Field(default_factory=list)
+
+
+# Request models
+class IncidentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1)
+    severity: Optional[Literal["SEV1", "SEV2", "SEV3", "SEV4"]] = "SEV1"
+    description: Optional[str] = None
+    id: Optional[str] = None
+
+
+class IncidentPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[IncidentStatus] = None
+    severity: Optional[Literal["SEV1", "SEV2", "SEV3", "SEV4"]] = None
+    summaryMarkdown: Optional[str] = None
+
+
+class ParticipantCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: Optional[str] = None
+    name: str = Field(min_length=1)
+    role: ParticipantRole = "Unknown"
+    avatarUrl: Optional[str] = None
+    isBot: Optional[bool] = False
+
+
+class ActionUpdateStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: ActionStatus
+
+
+# Rebuild Pydantic models for FastAPI compat with `from __future__ import annotations`
+for _cls in [Participant, TranscriptSegment, Fact, Hypothesis, Decision, ActionItem,
+             Gap, ToolEvent, TimelineEvent, Incident, IncidentSnapshot,
+             IncidentCreate, IncidentPatch, ParticipantCreate, ActionUpdateStatus]:
+    try:
+        _cls.model_rebuild()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# App + CORS
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Agora API", version="0.2.0", description="Real-time AI Incident Commander — Postgres-backed")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Redis (optional) + WS fanout
+# ---------------------------------------------------------------------------
+_redis_client: Any = None
+_redis_enabled = False
+_ws_connections: dict[str, Set[WebSocket]] = {}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _gen_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+# Redis init (graceful fallback)
+try:
+    import redis.asyncio as redis_async  # type: ignore
+except Exception:
+    redis_async = None  # type: ignore
+
+
+@app.on_event("startup")
+async def _startup():
+    # Init DB
+    await init_db()
+    # Init Redis
+    global _redis_client, _redis_enabled
+    url = os.getenv("REDIS_URL", "")
+    if redis_async is None:
+        logger.info("Redis library not available, using in-process broadcast")
+    elif url:
+        try:
+            client = redis_async.from_url(url, decode_responses=True, socket_connect_timeout=2)
+            await client.ping()
+            _redis_client = client
+            _redis_enabled = True
+            logger.info(f"Redis connected at {url}")
+        except Exception as e:
+            logger.warning(f"Redis unavailable ({e}), falling back to in-process broadcast")
+    else:
+        logger.info("No REDIS_URL set, using in-process broadcast")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _redis_client
+    if _redis_client:
+        try:
+            await _redis_client.close()
+        except Exception:
+            pass
+    await close_db()
+
+
+# ---------------------------------------------------------------------------
+# DB helpers: model ↔ Pydantic conversion
+# ---------------------------------------------------------------------------
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _next_seq(session: AsyncSession, incident_id: str) -> int:
+    """Get next timeline sequence number for an incident (atomic via SELECT FOR UPDATE)."""
+    result = await session.execute(
+        select(TimelineSeqModel).where(TimelineSeqModel.incident_id == incident_id).with_for_update()
+    )
+    seq_model = result.scalar_one_or_none()
+    if seq_model is None:
+        seq_model = TimelineSeqModel(incident_id=incident_id, current_seq=0)
+        session.add(seq_model)
+        await session.flush()
+    seq_model.current_seq += 1
+    return seq_model.current_seq
+
+
+def _model_to_participant(m: ParticipantModel) -> dict:
+    return {
+        "id": m.id, "name": m.name, "role": m.role,
+        "avatarUrl": m.avatar_url, "joinedAt": m.joined_at.isoformat(), "isBot": m.is_bot,
+    }
+
+
+def _model_to_transcript(m: TranscriptSegmentModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "speakerId": m.speaker_id,
+        "speakerName": m.speaker_name, "role": m.role, "text": m.text,
+        "isFinal": m.is_final, "startMs": m.start_ms, "endMs": m.end_ms,
+        "confidence": m.confidence, "language": m.language, "createdAt": m.created_at.isoformat(),
+    }
+
+
+def _model_to_fact(m: FactModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
+        "status": m.status, "confidence": m.confidence,
+        "sourceSegmentIds": m.source_segment_ids or [],
+        "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
+        "createdBy": m.created_by,
+    }
+
+
+def _model_to_hypothesis(m: HypothesisModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
+        "status": m.status, "confidence": m.confidence,
+        "sourceSegmentIds": m.source_segment_ids or [],
+        "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
+        "disprovenReason": m.disproven_reason,
+    }
+
+
+def _model_to_decision(m: DecisionModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
+        "status": m.status, "decidedBy": m.decided_by,
+        "decidedAt": m.decided_at.isoformat() if m.decided_at else None,
+        "sourceSegmentIds": m.source_segment_ids or [],
+        "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
+    }
+
+
+def _model_to_action(m: ActionItemModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "title": m.title,
+        "description": m.description, "ownerId": m.owner_id, "ownerName": m.owner_name,
+        "status": m.status, "requiresConfirmation": m.requires_confirmation,
+        "dueAt": m.due_at.isoformat() if m.due_at else None,
+        "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
+        "sourceSegmentIds": m.source_segment_ids or [],
+        "toolKey": m.tool_key, "toolPayload": m.tool_payload,
+    }
+
+
+def _model_to_gap(m: GapModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "kind": m.kind,
+        "severity": m.severity, "message": m.message,
+        "relatedIds": m.related_ids or [],
+        "createdAt": m.created_at.isoformat(),
+        "resolvedAt": m.resolved_at.isoformat() if m.resolved_at else None,
+    }
+
+
+def _model_to_timeline(m: TimelineEventModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "type": m.type,
+        "seq": m.seq, "createdAt": m.created_at.isoformat(),
+        "actorId": m.actor_id, "payload": m.payload or {}, "refId": m.ref_id,
+    }
+
+
+def _model_to_tool_event(m: ToolEventModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id, "tool": m.tool,
+        "action": m.action, "status": m.status, "payload": m.payload or {},
+        "result": m.result, "requiresApproval": m.requires_approval,
+        "actionItemId": m.action_item_id, "createdAt": m.created_at.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Snapshot builder (DB-backed)
+# ---------------------------------------------------------------------------
+async def _build_snapshot(session: AsyncSession, incident_id: str) -> dict[str, Any]:
+    """Build full IncidentSnapshot from DB."""
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+
+    # Participants
+    parts_r = await session.execute(
+        select(ParticipantModel).where(ParticipantModel.incident_id == incident_id)
+    )
+    participants = [_model_to_participant(p) for p in parts_r.scalars().all()]
+
+    incident_dict = {
+        "id": inc_m.id, "title": inc_m.title, "description": inc_m.description,
+        "status": inc_m.status, "severity": inc_m.severity,
+        "createdAt": inc_m.created_at.isoformat(), "updatedAt": inc_m.updated_at.isoformat(),
+        "participants": participants, "summaryMarkdown": inc_m.summary_markdown,
+    }
+
+    # Facts
+    facts_r = await session.execute(
+        select(FactModel).where(FactModel.incident_id == incident_id)
+    )
+    facts = [_model_to_fact(f) for f in facts_r.scalars().all()]
+
+    # Hypotheses
+    hyps_r = await session.execute(
+        select(HypothesisModel).where(HypothesisModel.incident_id == incident_id)
+    )
+    hypotheses = [_model_to_hypothesis(h) for h in hyps_r.scalars().all()]
+
+    # Decisions
+    decs_r = await session.execute(
+        select(DecisionModel).where(DecisionModel.incident_id == incident_id)
+    )
+    decisions = [_model_to_decision(d) for d in decs_r.scalars().all()]
+
+    # Actions
+    acts_r = await session.execute(
+        select(ActionItemModel).where(ActionItemModel.incident_id == incident_id)
+    )
+    actions = [_model_to_action(a) for a in acts_r.scalars().all()]
+
+    # Gaps
+    gaps_r = await session.execute(
+        select(GapModel).where(GapModel.incident_id == incident_id)
+    )
+    gaps = [_model_to_gap(g) for g in gaps_r.scalars().all()]
+
+    # Timeline (sorted by seq)
+    tl_r = await session.execute(
+        select(TimelineEventModel).where(TimelineEventModel.incident_id == incident_id).order_by(TimelineEventModel.seq)
+    )
+    timeline = [_model_to_timeline(t) for t in tl_r.scalars().all()]
+
+    # Transcript (sorted by start_ms)
+    tr_r = await session.execute(
+        select(TranscriptSegmentModel).where(TranscriptSegmentModel.incident_id == incident_id).order_by(TranscriptSegmentModel.start_ms)
+    )
+    transcript = [_model_to_transcript(t) for t in tr_r.scalars().all()]
+
+    # Tool events
+    te_r = await session.execute(
+        select(ToolEventModel).where(ToolEventModel.incident_id == incident_id)
+    )
+    tool_events = [_model_to_tool_event(te) for te in te_r.scalars().all()]
+
+    return {
+        "incident": incident_dict,
+        "facts": facts, "hypotheses": hypotheses, "decisions": decisions,
+        "actions": actions, "gaps": gaps, "timeline": timeline,
+        "transcript": transcript, "toolEvents": tool_events,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Timeline helper (DB-backed)
+# ---------------------------------------------------------------------------
+async def _append_timeline(
+    session: AsyncSession, incident_id: str, type_: str,
+    payload: dict[str, Any], actor_id: Optional[str] = None, ref_id: Optional[str] = None,
+) -> TimelineEventModel:
+    seq = await _next_seq(session, incident_id)
+    ev = TimelineEventModel(
+        id=_gen_id("evt"), incident_id=incident_id, type=type_, seq=seq,
+        created_at=_now(), actor_id=actor_id, payload=payload, ref_id=ref_id,
+    )
+    session.add(ev)
+    return ev
+
+
+# ---------------------------------------------------------------------------
+# WS broadcast
+# ---------------------------------------------------------------------------
+async def _broadcast(incident_id: str, message: dict[str, Any]):
+    if _redis_enabled and _redis_client is not None:
+        try:
+            await _redis_client.publish(f"incident:{incident_id}", json.dumps(message, default=str))
+        except Exception as e:
+            logger.warning(f"Redis publish failed: {e}")
+    conns = _ws_connections.get(incident_id, set()).copy()
+    dead: list[WebSocket] = []
+    for ws in conns:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _ws_connections.get(incident_id, set()).discard(ws)
+
+
+# ---------------------------------------------------------------------------
+# Gap detection (DB-backed)
+# ---------------------------------------------------------------------------
+async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
+    """Recompute auto-gaps from current facts/actions/hypotheses."""
+    # Remove old auto gaps
+    await session.execute(
+        delete(GapModel).where(
+            GapModel.incident_id == incident_id,
+            GapModel.id.like("gap-auto-%"),
+        )
+    )
+    await session.flush()
+
+    now = _now()
+    new_gaps: list[GapModel] = []
+
+    # --- Conflicting facts (percentage heuristic) ---
+    facts_r = await session.execute(
+        select(FactModel).where(FactModel.incident_id == incident_id)
+    )
+    facts = list(facts_r.scalars().all())
+    pct_facts: list[tuple[FactModel, list[str]]] = []
+    for f in facts:
+        nums = re.findall(r"(\d+(?:\.\d+)?)\s*%", f.statement)
+        if nums:
+            pct_facts.append((f, nums))
+    if len(pct_facts) >= 2:
+        values = set()
+        for _, nums in pct_facts:
+            values.update(nums)
+        if len(values) >= 2:
+            msg = f"Conflicting error-rate facts: {values}"
+            new_gaps.append(GapModel(
+                id="gap-auto-conflict-pct", incident_id=incident_id,
+                kind="ConflictingInfo", severity="high", message=msg,
+                related_ids=[f.id for f, _ in pct_facts[:2]], created_at=now,
+            ))
+
+    # --- Missing owner ---
+    acts_r = await session.execute(
+        select(ActionItemModel).where(ActionItemModel.incident_id == incident_id)
+    )
+    actions = list(acts_r.scalars().all())
+    for act in actions:
+        if act.status in ("Done", "Overdue"):
+            continue
+        if not act.owner_id and not act.owner_name:
+            new_gaps.append(GapModel(
+                id=f"gap-auto-missing-owner-{act.id}", incident_id=incident_id,
+                kind="MissingOwner", severity="medium",
+                message=f"Action '{act.title}' has no owner",
+                related_ids=[act.id], created_at=now,
+            ))
+
+    # --- Stale / overdue actions ---
+    for act in actions:
+        if act.status == "Done":
+            continue
+        age = (now - act.created_at).total_seconds()
+        overdue = act.due_at and now > act.due_at and act.status != "Done"
+        if age > 600 or overdue:
+            severity = "high" if overdue else "medium"
+            new_gaps.append(GapModel(
+                id=f"gap-auto-stale-{act.id}", incident_id=incident_id,
+                kind="StaleAction", severity=severity,
+                message=f"Action '{act.title}' is stale ({int(age//60)}m old)" + (" — overdue" if overdue else ""),
+                related_ids=[act.id], created_at=now,
+            ))
+
+    # --- Unverified hypotheses ---
+    hyps_r = await session.execute(
+        select(HypothesisModel).where(HypothesisModel.incident_id == incident_id)
+    )
+    for h in hyps_r.scalars().all():
+        if h.status == "Active":
+            new_gaps.append(GapModel(
+                id=f"gap-auto-unverified-{h.id}", incident_id=incident_id,
+                kind="UnverifiedAssumption", severity="medium",
+                message=f"Unverified hypothesis: {h.statement}",
+                related_ids=[h.id], created_at=now,
+            ))
+
+    # Insert new gaps
+    for gap in new_gaps:
+        existing = await session.get(GapModel, gap.id)
+        if existing:
+            existing.message = gap.message
+            existing.related_ids = gap.related_ids
+        else:
+            session.add(gap)
+            await _append_timeline(session, incident_id, "gap_detected",
+                                   {"kind": gap.kind, "severity": gap.severity, "message": gap.message},
+                                   ref_id=gap.id)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Inline cognition (regex-based extraction, deterministic for demo fixture)
+# ---------------------------------------------------------------------------
+async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel, incident_id: str):
+    """Inline extraction using regex + fixture-aware mapping for payment_outage demo."""
+    text = segment.text or ""
+    sid = segment.id
+    now = _now()
+
+    # Fixture-aware deterministic mapping
+    fixture_map: dict[str, str] = {
+        "u-001": "fact:12pct", "u-002": "fact:replica", "u-003": "fact:5xx",
+        "u-004": "hypothesis:deploy", "u-005": "fact:tickets",
+        "u-007": "decision:rollback", "u-008": "fact:2pct",
+        "u-010": "action:jira", "u-012": "action:comms",
+    }
+    kind = fixture_map.get(sid)
+
+    if kind == "fact:12pct":
+        fid = f"fact-{sid}"
+        existing = await session.get(FactModel, fid)
+        if not existing:
+            f = FactModel(
+                id=fid, incident_id=incident_id,
+                statement="Payment checkout error rate ~12% since 14:02 UTC",
+                status="Reported", confidence=0.75, source_segment_ids=[sid],
+                created_at=now, updated_at=now, created_by="inline",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    if kind == "fact:replica":
+        fid = f"fact-{sid}"
+        existing = await session.get(FactModel, fid)
+        if not existing:
+            f = FactModel(
+                id=fid, incident_id=incident_id,
+                statement="DB replica lag on payments-db-03 is ~45s",
+                status="Corroborated", confidence=0.85, source_segment_ids=[sid],
+                created_at=now, updated_at=now, created_by="inline",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    if kind == "fact:5xx":
+        fid = f"fact-{sid}"
+        existing = await session.get(FactModel, fid)
+        if not existing:
+            f = FactModel(
+                id=fid, incident_id=incident_id,
+                statement="Checkout 5xx count is 340 in last 5 minutes",
+                status="Corroborated", confidence=0.8, source_segment_ids=[sid],
+                created_at=now, updated_at=now, created_by="inline",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    if kind == "hypothesis:deploy":
+        hid = f"hypo-{sid}"
+        existing = await session.get(HypothesisModel, hid)
+        if not existing:
+            h = HypothesisModel(
+                id=hid, incident_id=incident_id,
+                statement="Recent deploy (retry logic change at 13:40) may have caused payment failures",
+                status="Active", confidence=0.45, source_segment_ids=[sid],
+                created_at=now, updated_at=now,
+            )
+            session.add(h)
+            await _append_timeline(session, incident_id, "hypothesis_created",
+                                   {"statement": h.statement, "status": h.status}, actor_id=segment.speaker_id, ref_id=hid)
+        return
+
+    if kind == "fact:tickets":
+        fid = f"fact-{sid}"
+        existing = await session.get(FactModel, fid)
+        if not existing:
+            f = FactModel(
+                id=fid, incident_id=incident_id,
+                statement="Support tickets flooded — 80 tickets in 10 minutes, all payment failures",
+                status="Reported", confidence=0.7, source_segment_ids=[sid],
+                created_at=now, updated_at=now, created_by="inline",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    if kind == "decision:rollback":
+        did = f"decision-{sid}"
+        existing = await session.get(DecisionModel, did)
+        if not existing:
+            d = DecisionModel(
+                id=did, incident_id=incident_id,
+                statement="Rollback payment service to v2.14.3",
+                status="Proposed", decided_by=segment.speaker_name or segment.speaker_id,
+                decided_at=now, source_segment_ids=[sid],
+                created_at=now, updated_at=now,
+            )
+            session.add(d)
+            await _append_timeline(session, incident_id, "decision",
+                                   {"statement": d.statement, "status": d.status}, actor_id=segment.speaker_id, ref_id=did)
+        return
+
+    if kind == "fact:2pct":
+        fid = f"fact-{sid}"
+        existing = await session.get(FactModel, fid)
+        if not existing:
+            f = FactModel(
+                id=fid, incident_id=incident_id,
+                statement="Error rate dropped to 2% at 14:06 (conflicting with 12%)",
+                status="Reported", confidence=0.6, source_segment_ids=[sid],
+                created_at=now, updated_at=now, created_by="inline",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    if kind == "action:jira":
+        aid = "action-jira-replica"
+        existing = await session.get(ActionItemModel, aid)
+        if not existing:
+            a = ActionItemModel(
+                id=aid, incident_id=incident_id,
+                title="Fix DB replica lag on payments-db-03",
+                description="Track DB replica fix — seen in demo fixture",
+                owner_id=None, owner_name="Backend", status="Open",
+                requires_confirmation=False,
+                due_at=now + timedelta(minutes=30),
+                created_at=now, updated_at=now, source_segment_ids=[sid],
+                tool_key="jira",
+                tool_payload={"project": "PAY", "summary": "Fix DB replica lag on payments-db-03"},
+            )
+            session.add(a)
+            await _append_timeline(session, incident_id, "action_created",
+                                   {"title": a.title, "status": a.status}, actor_id=segment.speaker_id, ref_id=aid)
+            # Tool event
+            te = ToolEventModel(
+                id=_gen_id("tool"), incident_id=incident_id, tool="jira",
+                action="create_issue", status="pending",
+                payload=a.tool_payload or {}, requires_approval=False,
+                action_item_id=aid, created_at=now,
+            )
+            session.add(te)
+            await _append_timeline(session, incident_id, "tool",
+                                   {"tool": "jira", "action": "create_issue", "status": "pending"}, ref_id=te.id)
+        return
+
+    if kind == "action:comms":
+        aid = "action-comms"
+        existing = await session.get(ActionItemModel, aid)
+        if not existing:
+            a = ActionItemModel(
+                id=aid, incident_id=incident_id,
+                title="Own customer comms / status page update",
+                description="Customer comms has no owner — needs assignment",
+                owner_id=None, owner_name=None, status="Open",
+                requires_confirmation=False, created_at=now, updated_at=now,
+                source_segment_ids=[sid], tool_key="slack",
+                tool_payload={"channel": "#incident-comms", "text": "Status page update for payment outage"},
+            )
+            session.add(a)
+            await _append_timeline(session, incident_id, "action_created",
+                                   {"title": a.title, "status": a.status}, actor_id=segment.speaker_id, ref_id=aid)
+        return
+
+    # u-011: update jira action to require confirmation
+    if sid == "u-011":
+        aid = "action-jira-replica"
+        act = await session.get(ActionItemModel, aid)
+        if act:
+            act.requires_confirmation = True
+            act.updated_at = now
+            await _append_timeline(session, incident_id, "action_updated",
+                                   {"title": act.title, "requiresConfirmation": True},
+                                   actor_id=segment.speaker_id, ref_id=aid)
+            # Update tool event
+            te_r = await session.execute(
+                select(ToolEventModel).where(
+                    ToolEventModel.incident_id == incident_id,
+                    ToolEventModel.action_item_id == aid,
+                )
+            )
+            for te in te_r.scalars().all():
+                te.requires_approval = True
+                te.status = "requiresApproval"
+        return
+
+    if sid in ("u-006", "u-009"):
+        return  # chatter, no extraction
+
+    # --- Generic regex fallback ---
+    _RE_HYPOTHESIS = re.compile(r"\bI think\b|maybe|might be|deploy.*caus|retry logic", re.I)
+    _RE_DECISION = re.compile(r"rollback|revert|let'?s\s+rollback|decide to", re.I)
+    _RE_ACTION_JIRA = re.compile(r"create.*jira|track.*fix|assign to", re.I)
+    _RE_ACTION_COMMS = re.compile(r"customer\s*comms|status\s*page|owner for", re.I)
+    _RE_ERROR_RATE = re.compile(r"error\s*rate", re.I)
+    _RE_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%", re.I)
+
+    tl = text.lower()
+
+    if _RE_ACTION_JIRA.search(text):
+        aid = _gen_id("action")
+        owner_name = "Backend" if "backend" in tl else None
+        a = ActionItemModel(
+            id=aid, incident_id=incident_id, title=text[:80].strip() or "Action from transcript",
+            description=text, owner_id=None, owner_name=owner_name, status="Open",
+            requires_confirmation=False, created_at=now, updated_at=now,
+            source_segment_ids=[sid], tool_key="jira" if "jira" in tl else None,
+        )
+        session.add(a)
+        await _append_timeline(session, incident_id, "action_created",
+                               {"title": a.title, "status": a.status}, actor_id=segment.speaker_id, ref_id=aid)
+        return
+
+    if _RE_ACTION_COMMS.search(text):
+        aid = _gen_id("action")
+        a = ActionItemModel(
+            id=aid, incident_id=incident_id,
+            title="Customer comms / status page update", description=text,
+            owner_id=None, owner_name=None, status="Open",
+            requires_confirmation=False, created_at=now, updated_at=now,
+            source_segment_ids=[sid],
+        )
+        session.add(a)
+        await _append_timeline(session, incident_id, "action_created",
+                               {"title": a.title, "status": a.status}, actor_id=segment.speaker_id, ref_id=aid)
+        return
+
+    if _RE_DECISION.search(text):
+        did = _gen_id("decision")
+        d = DecisionModel(
+            id=did, incident_id=incident_id, statement=text[:200],
+            status="Proposed", decided_by=segment.speaker_name or segment.speaker_id,
+            decided_at=now, source_segment_ids=[sid], created_at=now, updated_at=now,
+        )
+        session.add(d)
+        await _append_timeline(session, incident_id, "decision",
+                               {"statement": d.statement, "status": d.status}, actor_id=segment.speaker_id, ref_id=did)
+        return
+
+    if _RE_HYPOTHESIS.search(text):
+        hid = _gen_id("hypo")
+        h = HypothesisModel(
+            id=hid, incident_id=incident_id, statement=text[:200],
+            status="Active", confidence=0.45, source_segment_ids=[sid],
+            created_at=now, updated_at=now,
+        )
+        session.add(h)
+        await _append_timeline(session, incident_id, "hypothesis_created",
+                               {"statement": h.statement, "status": h.status}, actor_id=segment.speaker_id, ref_id=hid)
+        return
+
+    if _RE_ERROR_RATE.search(text) or _RE_PCT.search(text):
+        fid = _gen_id("fact")
+        f = FactModel(
+            id=fid, incident_id=incident_id, statement=text[:200],
+            status="Reported", confidence=0.7, source_segment_ids=[sid],
+            created_at=now, updated_at=now, created_by="inline",
+        )
+        session.add(f)
+        await _append_timeline(session, incident_id, "fact_created",
+                               {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        return
+
+    # chatter: no extraction
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/health", tags=["ops"])
+async def health():
+    pg = "ok"
+    redis_status = "mock"
+    if _redis_enabled and _redis_client is not None:
+        try:
+            await _redis_client.ping()
+            redis_status = "ok"
+        except Exception:
+            redis_status = "unavailable"
+    return {"status": "ok", "postgres": pg, "redis": redis_status}
+
+
+@app.get("/tools/status", tags=["ops"])
+async def tools_status():
+    def _s(key: str) -> str:
+        return "live" if os.getenv(key) else "mock"
+    return {
+        "jira": _s("JIRA_URL"), "slack": _s("SLACK_TOKEN"),
+        "pagerduty": _s("PAGERDUTY_KEY"), "datadog": _s("DATADOG_API_KEY"),
+        "deepgram": _s("DEEPGRAM_API_KEY"), "agora": _s("AGORA_APP_ID"),
+    }
+
+
+@app.post("/incidents", tags=["incidents"])
+async def create_incident(body: IncidentCreate, session: AsyncSession = Depends(get_db)):
+    now = _now()
+    iid = body.id or f"inc-{uuid.uuid4().hex[:8]}"
+    # Check uniqueness
+    existing = await session.get(IncidentModel, iid)
+    if existing:
+        iid = f"inc-{uuid.uuid4().hex[:8]}"
+
+    inc = IncidentModel(
+        id=iid, title=body.title, description=body.description,
+        status="open", severity=body.severity or "SEV1",
+        created_at=now, updated_at=now,
+    )
+    session.add(inc)
+    # Init sequence
+    session.add(TimelineSeqModel(incident_id=iid, current_seq=0))
+    await session.flush()
+    await _append_timeline(session, iid, "system", {"message": f"Incident created: {body.title}"}, ref_id=iid)
+    await session.flush()
+
+    snap = await _build_snapshot(session, iid)
+    await _broadcast(iid, {"type": "snapshot", "snapshot": snap})
+    return snap["incident"]
+
+
+@app.get("/incidents", tags=["incidents"])
+async def list_incidents(session: AsyncSession = Depends(get_db)):
+    result = await session.execute(select(IncidentModel))
+    incidents = []
+    for inc_m in result.scalars().all():
+        parts_r = await session.execute(
+            select(ParticipantModel).where(ParticipantModel.incident_id == inc_m.id)
+        )
+        participants = [_model_to_participant(p) for p in parts_r.scalars().all()]
+        incidents.append({
+            "id": inc_m.id, "title": inc_m.title, "description": inc_m.description,
+            "status": inc_m.status, "severity": inc_m.severity,
+            "createdAt": inc_m.created_at.isoformat(), "updatedAt": inc_m.updated_at.isoformat(),
+            "participants": participants, "summaryMarkdown": inc_m.summary_markdown,
+        })
+    return incidents
+
+
+@app.get("/incidents/{incident_id}", tags=["incidents"])
+async def get_incident(incident_id: str, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    parts_r = await session.execute(
+        select(ParticipantModel).where(ParticipantModel.incident_id == incident_id)
+    )
+    participants = [_model_to_participant(p) for p in parts_r.scalars().all()]
+    return {
+        "id": inc_m.id, "title": inc_m.title, "description": inc_m.description,
+        "status": inc_m.status, "severity": inc_m.severity,
+        "createdAt": inc_m.created_at.isoformat(), "updatedAt": inc_m.updated_at.isoformat(),
+        "participants": participants, "summaryMarkdown": inc_m.summary_markdown,
+    }
+
+
+@app.patch("/incidents/{incident_id}", tags=["incidents"])
+async def patch_incident(incident_id: str, body: IncidentPatch, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    now = _now()
+    if body.title is not None:
+        inc_m.title = body.title
+    if body.description is not None:
+        inc_m.description = body.description
+    if body.status is not None:
+        old = inc_m.status
+        inc_m.status = body.status
+        await _append_timeline(session, incident_id, "system",
+                               {"message": f"Status {old} -> {body.status}"}, ref_id=incident_id)
+    if body.severity is not None:
+        inc_m.severity = body.severity
+    if body.summaryMarkdown is not None:
+        inc_m.summary_markdown = body.summaryMarkdown
+    inc_m.updated_at = now
+    await session.flush()
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return snap["incident"]
+
+
+@app.post("/incidents/{incident_id}/participants", tags=["incidents"])
+async def add_participant(incident_id: str, body: ParticipantCreate, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    now = _now()
+    pid = body.id or _gen_id("p")
+    p = ParticipantModel(
+        id=pid, incident_id=incident_id, name=body.name,
+        role=body.role or "Unknown", avatar_url=body.avatarUrl,
+        joined_at=now, is_bot=body.isBot or False,
+    )
+    session.add(p)
+    await _append_timeline(session, incident_id, "system",
+                           {"message": f"Participant joined: {p.name} ({p.role})"},
+                           actor_id=pid, ref_id=pid)
+    await session.flush()
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return _model_to_participant(p)
+
+
+@app.get("/incidents/{incident_id}/snapshot", tags=["incidents"])
+async def get_snapshot(incident_id: str, session: AsyncSession = Depends(get_db)):
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+    return await _build_snapshot(session, incident_id)
+
+
+@app.post("/incidents/{incident_id}/transcript", tags=["transcript"])
+async def push_transcript(incident_id: str, body: dict[str, Any] = Body(...), session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+
+    # Resolve segment
+    seg_dict = body.get("segment") if isinstance(body.get("segment"), dict) else body
+    seg_dict.setdefault("incidentId", incident_id)
+    seg_dict["incidentId"] = incident_id
+
+    # Validate
+    try:
+        segment = TranscriptSegment.model_validate(seg_dict)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid TranscriptSegment: {e}")
+
+    now = _now()
+    seg_m = TranscriptSegmentModel(
+        id=segment.id, incident_id=incident_id, speaker_id=segment.speakerId,
+        speaker_name=segment.speakerName, role=segment.role, text=segment.text,
+        is_final=segment.isFinal, start_ms=segment.startMs, end_ms=segment.endMs,
+        confidence=segment.confidence, language=segment.language, created_at=now,
+    )
+    session.add(seg_m)
+    await _append_timeline(session, incident_id, "transcript",
+                           {"id": segment.id, "text": segment.text[:120], "speakerName": segment.speakerName},
+                           actor_id=segment.speakerId, ref_id=segment.id)
+
+    inc_m.updated_at = now
+
+    # Run cognition inline
+    await _run_cognition(session, seg_m, incident_id)
+
+    # Recompute gaps
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return {"ok": True, "segmentId": segment.id, "snapshot": snap}
+
+
+# Action endpoints
+@app.post("/incidents/{incident_id}/actions/{action_id}/approve", tags=["actions"])
+async def approve_action(incident_id: str, action_id: str, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    act = await session.get(ActionItemModel, action_id)
+    if not act or act.incident_id != incident_id:
+        raise HTTPException(status_code=404, detail="action not found")
+
+    now = _now()
+    if act.requires_confirmation:
+        act.requires_confirmation = False
+    if act.status == "Open":
+        act.status = "InProgress"
+    act.updated_at = now
+    await _append_timeline(session, incident_id, "action_updated",
+                           {"title": act.title, "status": act.status}, ref_id=action_id)
+
+    # Simulate tool event
+    te = ToolEventModel(
+        id=_gen_id("tool"), incident_id=incident_id, tool=act.tool_key or "jira",
+        action="create_issue", status="success",
+        payload=act.tool_payload or {},
+        result={"key": f"PAY-{uuid.uuid4().hex[:4].upper()}", "url": f"https://jira.example.com/browse/PAY-{uuid.uuid4().hex[:4]}"},
+        requires_approval=False, action_item_id=action_id, created_at=now,
+    )
+    session.add(te)
+    await _append_timeline(session, incident_id, "tool",
+                           {"tool": te.tool, "action": te.action, "status": "success"}, ref_id=te.id)
+
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return {"ok": True, "incidentId": incident_id, "actionId": action_id,
+            "status": act.status, "toolEvent": _model_to_tool_event(te)}
+
+
+@app.post("/incidents/{incident_id}/approve/{action_id}", tags=["actions"])
+async def approve_action_legacy(incident_id: str, action_id: str, session: AsyncSession = Depends(get_db)):
+    return await approve_action(incident_id, action_id, session)
+
+
+@app.post("/incidents/{incident_id}/actions/{action_id}/update-status", tags=["actions"])
+async def update_action_status(incident_id: str, action_id: str, body: ActionUpdateStatus, session: AsyncSession = Depends(get_db)):
+    act = await session.get(ActionItemModel, action_id)
+    if not act or act.incident_id != incident_id:
+        raise HTTPException(status_code=404, detail="action not found")
+    act.status = body.status
+    act.updated_at = _now()
+    await _append_timeline(session, incident_id, "action_updated",
+                           {"title": act.title, "status": act.status}, ref_id=action_id)
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return _model_to_action(act)
+
+
+@app.post("/incidents/{incident_id}/summary", tags=["incidents"])
+async def generate_summary(incident_id: str, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+    snap = await _build_snapshot(session, incident_id)
+
+    facts = snap["facts"]
+    hyps = snap["hypotheses"]
+    decs = snap["decisions"]
+    acts = snap["actions"]
+    gaps = snap["gaps"]
+    timeline = snap["timeline"]
+    participants = snap["incident"]["participants"]
+
+    lines: list[str] = []
+    lines.append(f"# Incident {incident_id} — {inc_m.title}")
+    lines.append("")
+    lines.append(f"_Severity: {inc_m.severity} | Status: {inc_m.status} | Generated: {_now().isoformat()}_")
+    lines.append("")
+    if inc_m.description:
+        lines.append(inc_m.description)
+        lines.append("")
+    lines.append("## Timeline (key events)")
+    for ev in timeline[-20:]:
+        lines.append(f"- [{ev['type']}] seq={ev['seq']} {json.dumps(ev['payload'])[:120]}")
+    lines.append("")
+    lines.append("## Facts")
+    if facts:
+        for f in facts:
+            lines.append(f"- **{f['status']}** ({f['confidence']:.2f}): {f['statement']} _[src: {', '.join(f['sourceSegmentIds'])}]_")
+    else:
+        lines.append("- _No facts yet_")
+    lines.append("")
+    lines.append("## Hypotheses")
+    if hyps:
+        for h in hyps:
+            lines.append(f"- **{h['status']}** ({h['confidence']:.2f}): {h['statement']}")
+    else:
+        lines.append("- _No hypotheses_")
+    lines.append("")
+    lines.append("## Decisions")
+    if decs:
+        for d in decs:
+            lines.append(f"- **{d['status']}**: {d['statement']} (by {d.get('decidedBy','unknown')})")
+    else:
+        lines.append("- _No decisions_")
+    lines.append("")
+    lines.append("## Actions")
+    if acts:
+        for a in acts:
+            owner = a.get('ownerName') or a.get('ownerId') or "_unassigned_"
+            lines.append(f"- [{a['status']}] **{a['title']}** — owner: {owner}{' (requires approval)' if a.get('requiresConfirmation') else ''}")
+    else:
+        lines.append("- _No actions_")
+    lines.append("")
+    lines.append("## Gaps / Risks")
+    if gaps:
+        for g in gaps:
+            lines.append(f"- **{g['kind']}** ({g['severity']}): {g['message']}")
+    else:
+        lines.append("- _No gaps detected_")
+    lines.append("")
+    lines.append("## Unresolved Risks")
+    unresolved = [g for g in gaps if g.get('resolvedAt') is None]
+    if unresolved:
+        for g in unresolved:
+            lines.append(f"- {g['message']}")
+    else:
+        lines.append("- _None_")
+    lines.append("")
+    lines.append("---")
+    lines.append(f"_Participants: {', '.join(p['name'] + ' (' + p['role'] + ')' for p in participants) if participants else 'none'}_")
+    markdown = "\n".join(lines)
+
+    inc_m.summary_markdown = markdown
+    inc_m.updated_at = _now()
+    await _append_timeline(session, incident_id, "summary", {"markdown": markdown[:500]}, ref_id=incident_id)
+    await session.flush()
+
+    snap = await _build_snapshot(session, incident_id)
+    await _broadcast(incident_id, {"type": "snapshot", "snapshot": snap})
+    return {"incidentId": incident_id, "markdown": markdown}
+
+
+# ---------------------------------------------------------------------------
+# WS timeline
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/incidents/{incident_id}")
+async def ws_timeline(websocket: WebSocket, incident_id: str):
+    await websocket.accept()
+    async with get_db() as session:
+        # Auto-create placeholder if not exists
+        inc_m = await session.get(IncidentModel, incident_id)
+        if not inc_m:
+            now = _now()
+            inc_m = IncidentModel(
+                id=incident_id, title=f"Incident {incident_id}",
+                status="open", severity="SEV1", created_at=now, updated_at=now,
+            )
+            session.add(inc_m)
+            session.add(TimelineSeqModel(incident_id=incident_id, current_seq=0))
+            await session.flush()
+            await _append_timeline(session, incident_id, "system",
+                                   {"message": "WS connected — placeholder incident created"}, ref_id=incident_id)
+            await session.commit()
+
+        snap = await _build_snapshot(session, incident_id)
+
+    conns = _ws_connections.setdefault(incident_id, set())
+    conns.add(websocket)
+
+    try:
+        await websocket.send_json({"type": "snapshot", "snapshot": snap})
+        await websocket.send_json({"type": "connected", "incidentId": incident_id})
+    except Exception:
+        pass
+
+    # Redis subscriber task
+    redis_task: Optional[asyncio.Task] = None
+    if _redis_enabled and _redis_client is not None:
+        async def _redis_listener():
+            try:
+                pubsub = _redis_client.pubsub()
+                await pubsub.subscribe(f"incident:{incident_id}")
+                async for msg in pubsub.listen():
+                    if msg.get("type") == "message":
+                        try:
+                            data = json.loads(msg["data"])
+                            await websocket.send_json(data)
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Redis listener ended: {e}")
+        redis_task = asyncio.create_task(_redis_listener())
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data in ("ping", '"ping"'):
+                await websocket.send_json({"type": "pong"})
+            else:
+                await websocket.send_json({"type": "ack", "echo": data})
+                try:
+                    obj = json.loads(data)
+                    if isinstance(obj, dict) and obj.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if redis_task:
+            redis_task.cancel()
+            try:
+                await redis_task
+            except Exception:
+                pass
+        conns = _ws_connections.get(incident_id, set())
+        conns.discard(websocket)
+        if not conns:
+            _ws_connections.pop(incident_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Convenience endpoints
+# ---------------------------------------------------------------------------
+@app.get("/incidents/{incident_id}/timeline", tags=["incidents"])
+async def get_timeline(incident_id: str, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    result = await session.execute(
+        select(TimelineEventModel).where(TimelineEventModel.incident_id == incident_id).order_by(TimelineEventModel.seq)
+    )
+    return [_model_to_timeline(e) for e in result.scalars().all()]
+
+
+@app.get("/incidents/{incident_id}/gaps", tags=["incidents"])
+async def get_gaps(incident_id: str, session: AsyncSession = Depends(get_db)):
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    await _detect_and_store_gaps(session, incident_id)
+    await session.flush()
+    result = await session.execute(
+        select(GapModel).where(GapModel.incident_id == incident_id)
+    )
+    return [_model_to_gap(g) for g in result.scalars().all()]
+
+
+@app.get("/", tags=["ops"])
+async def root():
+    return {"service": "agora-api", "version": "0.2.0", "docs": "/docs", "storage": "postgres"}
