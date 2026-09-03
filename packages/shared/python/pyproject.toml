@@ -1,0 +1,13 @@
+[project]
+name = "agora-shared"
+version = "0.1.0"
+description = "Pydantic mirror of @agora/shared"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.7", "pydantic-settings>=2.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
