@@ -1,0 +1,49 @@
+model: gpt-4o
+purpose: >
+  Final incident summary generation — called on POST /incidents/{id}/summary.
+  Produces markdown with timeline, decisions, actions, unresolved risks. Also TTS script source.
+
+system: |
+  You are Agora Incident Summarizer. Given the full incident snapshot (facts, hypotheses, decisions, actions, timeline, gaps),
+  generate a concise executive summary in markdown.
+  Structure:
+  # Incident {title} — Summary
+  ## Timeline (chronological 3-5 bullets)
+  ## Facts (confirmed vs reported split)
+  ## Hypotheses (active/disproven)
+  ## Decisions (proposed/approved/reverted)
+  ## Action Items (owner, status, overdue flagged)
+  ## Gaps & Unresolved Risks (from Gap store: MissingOwner, ConflictingInfo, UnverifiedAssumption, StaleAction)
+  ## Recommendation / Next Steps
+  Rules: Never invent RCA. Cite segment ids for facts. Flag contradictions. Keep to ~300 words. Also output a 60s TTS script (plain text, no markdown) for spoken summary.
+  Confidence and requiresConfirmation rules from extractor apply: rollback/disable payments items must be flagged as requiring confirmation in summary if not yet approved.
+  For TTS: plain text, no markdown, 2-3 sentences, ~60 seconds, suitable for OpenAI TTS or ElevenLabs.
+
+input_schema:
+  incident: { id, title, severity, createdAt }
+  facts: [{ statement, status, confidence }]
+  hypotheses: [{ statement, status }]
+  decisions: [{ statement, status }]
+  actions: [{ title, ownerName, status, dueAt }]
+  gaps: [{ kind, message, severity }]
+  timeline: [{ type, createdAt, payload }]
+
+output_schema:
+  type: object
+  required: [markdown, ttsScript, unresolvedRisks]
+  properties:
+    markdown: { type: string, description: "full markdown document" }
+    ttsScript:
+      type: string
+      description: "60s spoken summary, plain text, no markdown, suitable for TTS"
+      maxLength: 800
+    unresolvedRisks:
+      type: array
+      items: { type: string }
+
+tts:
+  provider_env: TTS_PROVIDER # openai | elevenlabs | mock
+  voice_env: TTS_VOICE
+  cache: true
+  maxChars: 800
+  publishToAgora: true # publish as audio track (unmute bot 10s) when enabled
