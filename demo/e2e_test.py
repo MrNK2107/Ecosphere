@@ -4,7 +4,7 @@ sys.path.insert(0, 'apps/api')
 sys.path.insert(0, 'packages/shared/python')
 from main import app
 
-client = TestClient(app)
+client = TestClient(app).__enter__()  # trigger startup/shutdown lifespan events (init_db)
 r=client.get('/health')
 print('health', r.status_code, r.json(), flush=True)
 r=client.post('/incidents', json={'id':'payment-001','title':'Payment checkout outage','severity':'SEV1','description':'test'})

@@ -1,7 +1,11 @@
 version: "3.9"
 services:
   postgres:
-    image: postgres:15-alpine
+    # pgvector/pgvector:pg15 = postgres:15 + the pgvector extension preinstalled (PRD §15,
+    # §8.10 Cross-Incident Memory). db.py's init_db() runs `CREATE EXTENSION IF NOT EXISTS vector`
+    # on Postgres only — models.py degrades to a plain JSON column on SQLite (tests), so nothing
+    # here is required for the app to run, only for the native vector column to be used.
+    image: pgvector/pgvector:pg15
     environment:
       POSTGRES_DB: agora
       POSTGRES_USER: agora

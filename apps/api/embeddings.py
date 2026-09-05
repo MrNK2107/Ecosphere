@@ -1,13 +1,20 @@
 """
-Embeddings-based conflict detection for incident facts.
-Uses OpenAI text-embedding-3-small for semantic similarity.
-Falls back gracefully when OPENAI_API_KEY is not set.
+Embeddings for semantic conflict detection (Fact vs Fact) and cross-incident precedent
+recall (PRD §8.10 Cross-Incident Memory: Hypothesis vs past-incident Hypotheses/Facts).
+
+Uses OpenAI text-embedding-3-small (dimensions=EMBED_DIM to match the pgvector column in
+models.py) when OPENAI_API_KEY is set. Otherwise falls back to a deterministic, dependency-free
+hashed bag-of-words embedding — consistent with the rest of this codebase's mock-first design:
+the feature works (coarse keyword-overlap similarity) with zero external keys, and upgrades to
+real semantic similarity automatically once a key is configured.
 """
 from __future__ import annotations
 
 import os
+import re
 import logging
 import math
+import hashlib
 from typing import Any
 
 import httpx
@@ -17,23 +24,45 @@ logger = logging.getLogger("agora.embeddings")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_ENABLED = bool(OPENAI_API_KEY)
+EMBED_DIM = 256  # must match models.EMBED_DIM
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "was", "are", "were", "to", "of", "in", "on", "at", "for", "and", "or",
+    "may", "might", "could", "have", "has", "had", "be", "been", "this", "that", "it", "its", "we",
+    "you", "he", "she", "they", "not", "no", "so", "if", "but", "with", "as", "by", "from", "will",
+}
 
 # In-memory cache: text -> embedding vector
 _cache: dict[str, list[float]] = {}
 
 
-async def get_embedding(text: str) -> list[float]:
-    """Get embedding vector for text via OpenAI API."""
-    if not EMBEDDING_ENABLED:
-        return []
+def _mock_embedding(text: str) -> list[float]:
+    """Deterministic hashed bag-of-words vector — no external dependency, always available."""
+    vec = [0.0] * EMBED_DIM
+    words = [w for w in re.findall(r"[a-zA-Z]{3,}", (text or "").lower()) if w not in _STOPWORDS]
+    for w in words:
+        idx = int(hashlib.sha1(w.encode("utf-8")).hexdigest(), 16) % EMBED_DIM
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0:
+        return vec
+    return [x / norm for x in vec]
 
+
+async def get_embedding(text: str) -> list[float]:
+    """Get embedding vector for text — OpenAI if configured, else the mock hashed fallback."""
     cache_key = text[:500]  # truncate for cache key
     if cache_key in _cache:
         return _cache[cache_key]
 
+    if not EMBEDDING_ENABLED:
+        vec = _mock_embedding(text)
+        _cache[cache_key] = vec
+        return vec
+
     url = "https://api.openai.com/v1/embeddings"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": EMBEDDING_MODEL, "input": text[:8000]}  # max tokens
+    payload = {"model": EMBEDDING_MODEL, "input": text[:8000], "dimensions": EMBED_DIM}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -44,8 +73,10 @@ async def get_embedding(text: str) -> list[float]:
             _cache[cache_key] = embedding
             return embedding
     except Exception as e:
-        logger.warning(f"Embedding request failed: {e}")
-        return []
+        logger.warning(f"Embedding request failed: {e} — falling back to mock embedding")
+        vec = _mock_embedding(text)
+        _cache[cache_key] = vec
+        return vec
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -68,7 +99,7 @@ async def find_similar_facts(
     Find pairs of facts with high semantic similarity.
     Returns list of (fact_a, fact_b, similarity) tuples.
     """
-    if not EMBEDDING_ENABLED or len(facts) < 2:
+    if len(facts) < 2:
         return []
 
     # Get embeddings for all facts
@@ -130,5 +161,35 @@ async def detect_embedding_conflicts(
                 "message": f"Semantically similar facts with conflicts: '{f1.get('statement', '')[:60]}' vs '{f2.get('statement', '')[:60]}' (sim={sim:.2f})",
                 "relatedIds": [f1["id"], f2["id"]],
             })
+
+    return gaps
+
+
+async def find_precedents(
+    statement: str,
+    candidates: list[dict[str, Any]],
+    top_k: int = 3,
+    threshold: float = 0.35,
+) -> list[dict[str, Any]]:
+    """
+    PRD §8.10 Cross-Incident Memory. Given a new Hypothesis/Fact statement, rank `candidates`
+    (each a dict with at least id/incidentId/statement, and optionally a precomputed
+    `embedding` list to avoid recomputation) by similarity and return the top matches.
+
+    Returns candidates augmented with a `similarity` float, highest first, above `threshold`.
+    The mock hashed embedding gives coarse keyword-overlap similarity; a real OPENAI_API_KEY
+    gives true semantic similarity — same call site, better results once configured.
+    """
+    if not candidates:
+        return []
+    query_emb = await get_embedding(statement)
+    scored: list[dict[str, Any]] = []
+    for c in candidates:
+        cand_emb = c.get("embedding") or await get_embedding(c.get("statement", ""))
+        sim = cosine_similarity(query_emb, cand_emb)
+        if sim >= threshold:
+            scored.append({**{k: v for k, v in c.items() if k != "embedding"}, "similarity": round(sim, 3)})
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:top_k]
 
     return gaps

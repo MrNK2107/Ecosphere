@@ -19,12 +19,17 @@ from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import (
+from models import (
     Base, IncidentModel, ParticipantModel, TranscriptSegmentModel,
-    FactModel, HypothesisModel, DecisionModel, ActionItemModel,
+    FactModel, HypothesisModel, DecisionModel, ActionItemModel, ConflictModel,
     GapModel, TimelineEventModel, ToolEventModel, TimelineSeqModel,
 )
-from .db import get_engine, init_db, close_db, get_db
+from db import get_engine, init_db, close_db, get_db
+import tools
+import embeddings
+import cognition
+import agora_conversational_ai
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger("agora.api")
 logging.basicConfig(level=logging.INFO)
@@ -59,7 +64,7 @@ FactStatus = Literal["Confirmed", "Corroborated", "Reported", "Contradicted"]
 HypothesisStatus = Literal["Active", "Disproven", "Confirmed"]
 DecisionStatus = Literal["Proposed", "Approved", "Reverted"]
 ActionStatus = Literal["Open", "InProgress", "Blocked", "Done", "Overdue"]
-GapKind = Literal["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction"]
+GapKind = Literal["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction", "AssumptionCreep", "DuplicateWork", "DecisionHygiene"]
 TimelineEventType = Literal[
     "transcript", "fact_created", "fact_updated",
     "hypothesis_created", "hypothesis_updated",
@@ -105,6 +110,7 @@ class Fact(BaseModel):
     statement: str
     status: FactStatus
     confidence: float = Field(ge=0, le=1)
+    verificationStatus: Literal["verified", "contradicted", "unverified", "unknown", "unavailable"] = "unverified"
     sourceSegmentIds: list[str] = Field(min_length=1)
     createdAt: datetime
     updatedAt: datetime
@@ -118,6 +124,8 @@ class Hypothesis(BaseModel):
     statement: str
     status: HypothesisStatus
     confidence: float = Field(ge=0, le=1)
+    verificationStatus: Literal["verified", "contradicted", "unverified", "unknown", "unavailable"] = "unverified"
+    referenceCount: int = Field(ge=0, default=1)
     sourceSegmentIds: list[str] = Field(default_factory=list)
     createdAt: datetime
     updatedAt: datetime
@@ -132,6 +140,9 @@ class Decision(BaseModel):
     status: DecisionStatus
     decidedBy: Optional[str] = None
     decidedAt: Optional[datetime] = None
+    expectedOutcome: Optional[str] = None
+    risk: Optional[str] = None
+    rollbackPlan: Optional[str] = None
     sourceSegmentIds: list[str] = Field(default_factory=list)
     createdAt: datetime
     updatedAt: datetime
@@ -164,6 +175,21 @@ class Gap(BaseModel):
     message: str
     relatedIds: list[str] = Field(default_factory=list)
     createdAt: datetime
+    resolvedAt: Optional[datetime] = None
+
+
+class Conflict(BaseModel):
+    """PRD §10.3 — first-class contradiction record with its own review lifecycle."""
+    model_config = model_config
+    id: str
+    incidentId: str
+    claimA: str
+    claimB: str
+    status: Literal["OPEN", "UNDER_REVIEW", "RESOLVED", "DISMISSED"] = "OPEN"
+    resolution: Optional[str] = None
+    verificationRequired: bool = True
+    relatedIds: list[str] = Field(default_factory=list)
+    detectedAt: datetime
     resolvedAt: Optional[datetime] = None
 
 
@@ -213,6 +239,7 @@ class IncidentSnapshot(BaseModel):
     hypotheses: list[Hypothesis] = Field(default_factory=list)
     decisions: list[Decision] = Field(default_factory=list)
     actions: list[ActionItem] = Field(default_factory=list)
+    conflicts: list[Conflict] = Field(default_factory=list)
     gaps: list[Gap] = Field(default_factory=list)
     timeline: list[TimelineEvent] = Field(default_factory=list)
     transcript: list[TranscriptSegment] = Field(default_factory=list)
@@ -253,7 +280,7 @@ class ActionUpdateStatus(BaseModel):
 
 # Rebuild Pydantic models for FastAPI compat with `from __future__ import annotations`
 for _cls in [Participant, TranscriptSegment, Fact, Hypothesis, Decision, ActionItem,
-             Gap, ToolEvent, TimelineEvent, Incident, IncidentSnapshot,
+             Gap, Conflict, ToolEvent, TimelineEvent, Incident, IncidentSnapshot,
              IncidentCreate, IncidentPatch, ParticipantCreate, ActionUpdateStatus]:
     try:
         _cls.model_rebuild()
@@ -287,6 +314,13 @@ def _now() -> datetime:
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Coerce a possibly-naive datetime (e.g. from SQLite, which drops tzinfo) to UTC-aware."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 # Redis init (graceful fallback)
@@ -370,6 +404,7 @@ def _model_to_fact(m: FactModel) -> dict:
     return {
         "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
         "status": m.status, "confidence": m.confidence,
+        "verificationStatus": m.verification_status or "unverified",
         "sourceSegmentIds": m.source_segment_ids or [],
         "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
         "createdBy": m.created_by,
@@ -380,9 +415,23 @@ def _model_to_hypothesis(m: HypothesisModel) -> dict:
     return {
         "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
         "status": m.status, "confidence": m.confidence,
+        "verificationStatus": m.verification_status or "unverified",
+        "referenceCount": m.reference_count if m.reference_count is not None else 1,
         "sourceSegmentIds": m.source_segment_ids or [],
         "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
         "disprovenReason": m.disproven_reason,
+    }
+
+
+def _model_to_conflict(m: ConflictModel) -> dict:
+    return {
+        "id": m.id, "incidentId": m.incident_id,
+        "claimA": m.claim_a, "claimB": m.claim_b,
+        "status": m.status, "resolution": m.resolution,
+        "verificationRequired": m.verification_required,
+        "relatedIds": m.related_ids or [],
+        "detectedAt": m.detected_at.isoformat(),
+        "resolvedAt": m.resolved_at.isoformat() if m.resolved_at else None,
     }
 
 
@@ -391,6 +440,7 @@ def _model_to_decision(m: DecisionModel) -> dict:
         "id": m.id, "incidentId": m.incident_id, "statement": m.statement,
         "status": m.status, "decidedBy": m.decided_by,
         "decidedAt": m.decided_at.isoformat() if m.decided_at else None,
+        "expectedOutcome": m.expected_outcome, "risk": m.risk, "rollbackPlan": m.rollback_plan,
         "sourceSegmentIds": m.source_segment_ids or [],
         "createdAt": m.created_at.isoformat(), "updatedAt": m.updated_at.isoformat(),
     }
@@ -487,6 +537,12 @@ async def _build_snapshot(session: AsyncSession, incident_id: str) -> dict[str, 
     )
     gaps = [_model_to_gap(g) for g in gaps_r.scalars().all()]
 
+    # Conflicts
+    conf_r = await session.execute(
+        select(ConflictModel).where(ConflictModel.incident_id == incident_id)
+    )
+    conflicts = [_model_to_conflict(c) for c in conf_r.scalars().all()]
+
     # Timeline (sorted by seq)
     tl_r = await session.execute(
         select(TimelineEventModel).where(TimelineEventModel.incident_id == incident_id).order_by(TimelineEventModel.seq)
@@ -508,7 +564,7 @@ async def _build_snapshot(session: AsyncSession, incident_id: str) -> dict[str, 
     return {
         "incident": incident_dict,
         "facts": facts, "hypotheses": hypotheses, "decisions": decisions,
-        "actions": actions, "gaps": gaps, "timeline": timeline,
+        "actions": actions, "conflicts": conflicts, "gaps": gaps, "timeline": timeline,
         "transcript": transcript, "toolEvents": tool_events,
     }
 
@@ -552,8 +608,20 @@ async def _broadcast(incident_id: str, message: dict[str, Any]):
 # ---------------------------------------------------------------------------
 # Gap detection (DB-backed)
 # ---------------------------------------------------------------------------
+_STOPWORDS = {
+    "the", "a", "an", "is", "was", "are", "were", "to", "of", "in", "on", "at", "for", "and", "or",
+    "may", "might", "could", "have", "has", "had", "be", "been", "this", "that", "it", "its", "we",
+    "you", "he", "she", "they", "not", "no", "so", "if", "but", "with", "as", "by", "from", "will",
+    "would", "should", "can", "did", "do", "does", "still", "just", "also", "than", "then", "into",
+}
+
+
+def _significant_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-zA-Z]{4,}", (text or "").lower()) if w not in _STOPWORDS}
+
+
 async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
-    """Recompute auto-gaps from current facts/actions/hypotheses."""
+    """Recompute auto-gaps from current facts/actions/hypotheses/decisions."""
     # Remove old auto gaps
     await session.execute(
         delete(GapModel).where(
@@ -566,7 +634,7 @@ async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
     now = _now()
     new_gaps: list[GapModel] = []
 
-    # --- Conflicting facts (percentage heuristic) ---
+    # --- Conflicting facts (percentage heuristic) -> Gap + first-class Conflict record ---
     facts_r = await session.execute(
         select(FactModel).where(FactModel.incident_id == incident_id)
     )
@@ -587,6 +655,21 @@ async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
                 kind="ConflictingInfo", severity="high", message=msg,
                 related_ids=[f.id for f, _ in pct_facts[:2]], created_at=now,
             ))
+            claim_a, claim_b = pct_facts[0][0].statement, pct_facts[1][0].statement
+            conflict_id = "conflict-auto-pct"
+            existing_conflict = await session.get(ConflictModel, conflict_id)
+            if existing_conflict:
+                if existing_conflict.status not in ("RESOLVED", "DISMISSED"):
+                    existing_conflict.claim_a = claim_a
+                    existing_conflict.claim_b = claim_b
+                    existing_conflict.related_ids = [f.id for f, _ in pct_facts[:2]]
+            else:
+                session.add(ConflictModel(
+                    id=conflict_id, incident_id=incident_id,
+                    claim_a=claim_a, claim_b=claim_b, status="OPEN",
+                    verification_required=True,
+                    related_ids=[f.id for f, _ in pct_facts[:2]], detected_at=now,
+                ))
 
     # --- Missing owner ---
     acts_r = await session.execute(
@@ -604,12 +687,12 @@ async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
                 related_ids=[act.id], created_at=now,
             ))
 
-    # --- Stale / overdue actions ---
+    # --- Stale / overdue actions (+ one-time stall nudge, PRD §8.8) ---
     for act in actions:
         if act.status == "Done":
             continue
-        age = (now - act.created_at).total_seconds()
-        overdue = act.due_at and now > act.due_at and act.status != "Done"
+        age = (now - _aware(act.created_at)).total_seconds()
+        overdue = act.due_at and now > _aware(act.due_at) and act.status != "Done"
         if age > 600 or overdue:
             severity = "high" if overdue else "medium"
             new_gaps.append(GapModel(
@@ -618,18 +701,88 @@ async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
                 message=f"Action '{act.title}' is stale ({int(age//60)}m old)" + (" — overdue" if overdue else ""),
                 related_ids=[act.id], created_at=now,
             ))
+            if act.owner_name:
+                await _maybe_send_stall_nudge(session, incident_id, act, int(age // 60))
 
-    # --- Unverified hypotheses ---
+    # --- Duplicate-work detection (PRD §8.6): open actions, different owners, overlapping topic ---
+    open_owned = [a for a in actions if a.status in ("Open", "InProgress") and a.owner_name]
+    seen_pairs: set[tuple[str, str]] = set()
+    for i, a1 in enumerate(open_owned):
+        words1 = _significant_words(f"{a1.title} {a1.description or ''}")
+        for a2 in open_owned[i + 1:]:
+            if a1.owner_name == a2.owner_name:
+                continue
+            pair_key = tuple(sorted([a1.id, a2.id]))
+            if pair_key in seen_pairs:
+                continue
+            words2 = _significant_words(f"{a2.title} {a2.description or ''}")
+            overlap = words1 & words2
+            if len(overlap) >= 2:
+                seen_pairs.add(pair_key)
+                new_gaps.append(GapModel(
+                    id=f"gap-auto-dupe-{pair_key[0]}-{pair_key[1]}", incident_id=incident_id,
+                    kind="DuplicateWork", severity="medium",
+                    message=f"'{a1.owner_name}' and '{a2.owner_name}' appear to be investigating the same thing "
+                            f"({a1.title!r} / {a2.title!r})",
+                    related_ids=[a1.id, a2.id], created_at=now,
+                ))
+
+    # --- Unverified hypotheses + assumption-creep (PRD §8.5) ---
     hyps_r = await session.execute(
         select(HypothesisModel).where(HypothesisModel.incident_id == incident_id)
     )
-    for h in hyps_r.scalars().all():
-        if h.status == "Active":
+    hypotheses = list(hyps_r.scalars().all())
+    segs_r = await session.execute(
+        select(TranscriptSegmentModel).where(TranscriptSegmentModel.incident_id == incident_id)
+    )
+    segments = list(segs_r.scalars().all())
+    for h in hypotheses:
+        if h.status != "Active":
+            continue
+        new_gaps.append(GapModel(
+            id=f"gap-auto-unverified-{h.id}", incident_id=incident_id,
+            kind="UnverifiedAssumption", severity="medium",
+            message=f"Unverified hypothesis: {h.statement}",
+            related_ids=[h.id], created_at=now,
+        ))
+        key_words = _significant_words(h.statement)
+        mention_count = 0
+        if key_words:
+            for seg in segments:
+                seg_words = _significant_words(seg.text)
+                if len(key_words & seg_words) >= 2:
+                    mention_count += 1
+        h.reference_count = max(mention_count, 1)
+        if h.embedding is None:
+            h.embedding = await embeddings.get_embedding(h.statement)
+        if mention_count >= 3:
             new_gaps.append(GapModel(
-                id=f"gap-auto-unverified-{h.id}", incident_id=incident_id,
-                kind="UnverifiedAssumption", severity="medium",
-                message=f"Unverified hypothesis: {h.statement}",
+                id=f"gap-auto-assumption-creep-{h.id}", incident_id=incident_id,
+                kind="AssumptionCreep", severity="high",
+                message=f"Hypothesis referenced {mention_count}x but still unverified — "
+                        f"verify before acting on it: {h.statement}",
                 related_ids=[h.id], created_at=now,
+            ))
+
+    # --- Decision hygiene (PRD §8.9): Approved decisions missing completeness fields ---
+    decs_r = await session.execute(
+        select(DecisionModel).where(DecisionModel.incident_id == incident_id)
+    )
+    for d in decs_r.scalars().all():
+        if d.status != "Approved":
+            continue
+        missing = [
+            label for label, val in [
+                ("owner", d.decided_by), ("expected outcome", d.expected_outcome),
+                ("risk", d.risk), ("rollback plan", d.rollback_plan),
+            ] if not val
+        ]
+        if missing:
+            new_gaps.append(GapModel(
+                id=f"gap-auto-decision-hygiene-{d.id}", incident_id=incident_id,
+                kind="DecisionHygiene", severity="medium",
+                message=f"Decision '{d.statement}' approved but missing: {', '.join(missing)}",
+                related_ids=[d.id], created_at=now,
             ))
 
     # Insert new gaps
@@ -644,6 +797,25 @@ async def _detect_and_store_gaps(session: AsyncSession, incident_id: str):
                                    {"kind": gap.kind, "severity": gap.severity, "message": gap.message},
                                    ref_id=gap.id)
     await session.flush()
+
+
+async def _maybe_send_stall_nudge(session: AsyncSession, incident_id: str, act: ActionItemModel, age_minutes: int) -> None:
+    """PRD §8.8 Stall Nudges — send at most one mock-Slack reminder per action via tools.invoke_tool."""
+    nudge_id = f"tool-nudge-{act.id}"
+    existing = await session.get(ToolEventModel, nudge_id)
+    if existing:
+        return
+    ctx = {"incidentId": incident_id, "actionItemId": act.id, "requiresConfirmation": False}
+    payload = {"text": f"{act.owner_name}, '{act.title}' has been open {age_minutes}m — update?"}
+    result = await tools.invoke_tool("slack", "post", payload, ctx)
+    session.add(ToolEventModel(
+        id=nudge_id, incident_id=incident_id, tool="slack", action="stall_nudge",
+        status=result.get("status", "success"), payload=payload, result=result.get("result"),
+        requires_approval=False, action_item_id=act.id, created_at=_now(),
+    ))
+    await _append_timeline(session, incident_id, "tool",
+                           {"tool": "slack", "action": "stall_nudge", "actionItemId": act.id},
+                           ref_id=nudge_id)
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +1089,88 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
                                {"statement": f.statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
         return
 
-    # chatter: no extraction
+    # Nothing matched the fixture map or the regex heuristics — fall through to the real
+    # LLM classifier (PRD §8.1) instead of silently treating this as chatter. This is what
+    # makes cognition.py's extract()/Claude integration reachable outside the demo fixture.
+    await _run_llm_extraction(session, segment, incident_id)
+
+
+async def _run_llm_extraction(session: AsyncSession, segment: TranscriptSegmentModel, incident_id: str) -> None:
+    """PRD §8.1 LLM Classifier fallback — materializes cognition.extract()'s extractions into rows."""
+    sid, text, now = segment.id, segment.text or "", _now()
+
+    facts_r = await session.execute(
+        select(FactModel).where(FactModel.incident_id == incident_id).order_by(FactModel.created_at.desc()).limit(10)
+    )
+    hyps_r = await session.execute(
+        select(HypothesisModel).where(HypothesisModel.incident_id == incident_id).order_by(HypothesisModel.created_at.desc()).limit(5)
+    )
+    segs_r = await session.execute(
+        select(TranscriptSegmentModel).where(TranscriptSegmentModel.incident_id == incident_id).order_by(TranscriptSegmentModel.start_ms.desc()).limit(5)
+    )
+    snapshot_ctx = {
+        "facts": [{"id": f.id, "statement": f.statement, "status": f.status} for f in facts_r.scalars().all()],
+        "hypotheses": [{"id": h.id, "statement": h.statement, "status": h.status} for h in hyps_r.scalars().all()],
+        "transcript": [{"id": s.id, "text": s.text, "speakerName": s.speaker_name} for s in segs_r.scalars().all()],
+    }
+    segment_dict = {
+        "id": sid, "incidentId": incident_id, "text": text,
+        "speakerName": segment.speaker_name, "role": segment.role, "startMs": segment.start_ms,
+    }
+    try:
+        result = await cognition.extract(segment_dict, incident_id, snapshot_ctx)
+    except Exception as e:
+        logger.warning(f"LLM extraction fallback failed: {e}")
+        return
+
+    for ext in result.get("extractions", []):
+        kind = ext.get("kind")
+        statement = (ext.get("statement") or "")[:500]
+        confidence = float(ext.get("confidence", 0.6))
+        source_ids = ext.get("sourceSegmentIds") or [sid]
+        if kind == "Fact":
+            fid = _gen_id("fact")
+            f = FactModel(
+                id=fid, incident_id=incident_id, statement=statement,
+                status=ext.get("status") or "Reported", confidence=confidence,
+                source_segment_ids=source_ids, created_at=now, updated_at=now, created_by="llm",
+            )
+            session.add(f)
+            await _append_timeline(session, incident_id, "fact_created",
+                                   {"statement": statement, "status": f.status}, actor_id=segment.speaker_id, ref_id=fid)
+        elif kind == "Hypothesis":
+            hid = _gen_id("hypo")
+            h = HypothesisModel(
+                id=hid, incident_id=incident_id, statement=statement,
+                status="Active", confidence=confidence, source_segment_ids=source_ids,
+                created_at=now, updated_at=now,
+            )
+            session.add(h)
+            await _append_timeline(session, incident_id, "hypothesis_created",
+                                   {"statement": statement, "status": h.status}, actor_id=segment.speaker_id, ref_id=hid)
+        elif kind == "Decision":
+            did = _gen_id("decision")
+            d = DecisionModel(
+                id=did, incident_id=incident_id, statement=statement,
+                status="Proposed", decided_by=segment.speaker_name or segment.speaker_id, decided_at=now,
+                source_segment_ids=source_ids, created_at=now, updated_at=now,
+            )
+            session.add(d)
+            await _append_timeline(session, incident_id, "decision",
+                                   {"statement": statement, "status": d.status}, actor_id=segment.speaker_id, ref_id=did)
+        elif kind == "ActionItem":
+            aid = _gen_id("action")
+            a = ActionItemModel(
+                id=aid, incident_id=incident_id, title=(ext.get("title") or statement)[:512],
+                description=statement, owner_id=None, owner_name=ext.get("ownerName"),
+                status="Open", requires_confirmation=bool(ext.get("requiresConfirmation")),
+                due_at=None, created_at=now, updated_at=now, source_segment_ids=source_ids,
+                tool_key=ext.get("toolKey"),
+            )
+            session.add(a)
+            await _append_timeline(session, incident_id, "action_created",
+                                   {"title": a.title, "status": a.status}, actor_id=segment.speaker_id, ref_id=aid)
+        # Chatter / ToolRequest / unrecognized kinds: no row created.
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +1197,81 @@ async def tools_status():
         "jira": _s("JIRA_URL"), "slack": _s("SLACK_TOKEN"),
         "pagerduty": _s("PAGERDUTY_KEY"), "datadog": _s("DATADOG_API_KEY"),
         "deepgram": _s("DEEPGRAM_API_KEY"), "agora": _s("AGORA_APP_ID"),
+        "agora_conversational_ai": "live" if agora_conversational_ai.CAI_ENABLED else "mock",
     }
+
+
+# ---------------------------------------------------------------------------
+# Agora Conversational AI Engine — mandatory hackathon integration
+# ---------------------------------------------------------------------------
+_agora_agents: dict[str, str] = {}  # incidentId -> agent_id, in-process (single-worker) tracking
+
+
+@app.post("/incidents/{incident_id}/agora-agent/join", tags=["agora"])
+async def agora_agent_join(
+    incident_id: str,
+    body: dict[str, Any] = Body(...),
+    session: AsyncSession = Depends(get_db),
+):
+    """Start the Conversational AI agent on this incident's RTC channel.
+    Body: {channel, agentRtcUid, rtcToken}. Token minting stays in the worker (already has an
+    Agora RTC token builder) — this endpoint only orchestrates the CAI agent lifecycle."""
+    inc_m = await session.get(IncidentModel, incident_id)
+    if not inc_m:
+        raise HTTPException(status_code=404, detail="incident not found")
+    channel = body.get("channel") or incident_id
+    agent_rtc_uid = body.get("agentRtcUid") or "echosphere-bot"
+    rtc_token = body.get("rtcToken", "")
+    system_prompt = (
+        f"You are EchoSphere, an AI Incident Commander in the voice room for incident "
+        f"'{inc_m.title}' (severity {inc_m.severity}). {cognition.VOICE_REPLY_SYSTEM_PROMPT}"
+    )
+    result = await agora_conversational_ai.join_agent(incident_id, channel, agent_rtc_uid, rtc_token, system_prompt)
+    agent_id = result.get("agent_id", "")
+    if agent_id:
+        _agora_agents[incident_id] = agent_id
+    await _append_timeline(session, incident_id, "system",
+                           {"message": f"Agora Conversational AI agent joined ({result.get('status', 'unknown')})"})
+    await session.flush()
+    return result
+
+
+@app.post("/incidents/{incident_id}/agora-agent/leave", tags=["agora"])
+async def agora_agent_leave(incident_id: str, session: AsyncSession = Depends(get_db)):
+    agent_id = _agora_agents.pop(incident_id, None)
+    if not agent_id:
+        raise HTTPException(status_code=404, detail="no running agent for this incident")
+    result = await agora_conversational_ai.leave_agent(agent_id)
+    await _append_timeline(session, incident_id, "system", {"message": "Agora Conversational AI agent left"})
+    await session.flush()
+    return result
+
+
+@app.post("/agora/llm/chat/completions", tags=["agora"])
+async def agora_custom_llm(body: dict[str, Any] = Body(...)):
+    """Custom-LLM webhook for Agora Conversational AI Engine (AGORA_CAI_LLM_MODE=custom).
+    Agora calls this with an OpenAI-chat-completions-shaped request and requires an SSE stream
+    of chat.completion.chunk objects back. This is the AI's spoken voice in the room — separate
+    from the Fact/Hypothesis/Decision/Action extraction pipeline, which is fed via the room's
+    transcript arriving at POST /incidents/{id}/transcript (see agora_conversational_ai.py)."""
+    messages = body.get("messages", [])
+    reply_text = await cognition.generate_voice_reply(messages)
+    response_id = _gen_id("chatcmpl")
+
+    async def _sse():
+        chunk = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        final_chunk = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_sse(), media_type="text/event-stream")
 
 
 @app.post("/incidents", tags=["incidents"])
@@ -1073,6 +1400,8 @@ async def push_transcript(incident_id: str, body: dict[str, Any] = Body(...), se
     seg_dict = body.get("segment") if isinstance(body.get("segment"), dict) else body
     seg_dict.setdefault("incidentId", incident_id)
     seg_dict["incidentId"] = incident_id
+    seg_dict.setdefault("id", _gen_id("seg"))
+    seg_dict.setdefault("createdAt", _now().isoformat())
 
     # Validate
     try:
@@ -1081,6 +1410,13 @@ async def push_transcript(incident_id: str, body: dict[str, Any] = Body(...), se
         raise HTTPException(status_code=422, detail=f"Invalid TranscriptSegment: {e}")
 
     now = _now()
+    # Idempotent: replaying the same segment id into the same incident (retry, re-seed without a
+    # restart) must not crash or double-count facts/gaps/timeline entries.
+    existing_seg = await session.get(TranscriptSegmentModel, (segment.id, incident_id))
+    if existing_seg is not None:
+        snap = await _build_snapshot(session, incident_id)
+        return {"ok": True, "segmentId": segment.id, "snapshot": snap, "duplicate": True}
+
     seg_m = TranscriptSegmentModel(
         id=segment.id, incident_id=incident_id, speaker_id=segment.speakerId,
         speaker_name=segment.speakerName, role=segment.role, text=segment.text,

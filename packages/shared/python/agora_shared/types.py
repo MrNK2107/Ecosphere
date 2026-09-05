@@ -11,7 +11,9 @@ FactStatus = Literal["Confirmed", "Corroborated", "Reported", "Contradicted"]
 HypothesisStatus = Literal["Active", "Disproven", "Confirmed"]
 DecisionStatus = Literal["Proposed", "Approved", "Reverted"]
 ActionStatus = Literal["Open", "InProgress", "Blocked", "Done", "Overdue"]
-GapKind = Literal["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction"]
+GapKind = Literal["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction", "AssumptionCreep", "DuplicateWork", "DecisionHygiene"]
+VerificationStatus = Literal["verified", "contradicted", "unverified", "unknown", "unavailable"]
+ConflictStatus = Literal["OPEN", "UNDER_REVIEW", "RESOLVED", "DISMISSED"]
 TimelineEventType = Literal[
     "transcript", "fact_created", "fact_updated",
     "hypothesis_created", "hypothesis_updated",
@@ -56,6 +58,7 @@ class Fact(BaseModel):
     statement: str
     status: FactStatus
     confidence: float = Field(ge=0, le=1)
+    verificationStatus: VerificationStatus = "unverified"
     sourceSegmentIds: list[str] = Field(min_length=1, description="utteranceIds that support this fact")
     createdAt: datetime
     updatedAt: datetime
@@ -68,6 +71,8 @@ class Hypothesis(BaseModel):
     statement: str
     status: HypothesisStatus
     confidence: float = Field(ge=0, le=1)
+    verificationStatus: VerificationStatus = "unverified"
+    referenceCount: int = Field(ge=0, default=1, description="PRD §8.5 assumption-creep: times referenced/reinforced")
     sourceSegmentIds: list[str] = Field(default_factory=list)
     createdAt: datetime
     updatedAt: datetime
@@ -81,9 +86,26 @@ class Decision(BaseModel):
     status: DecisionStatus
     decidedBy: Optional[str] = None
     decidedAt: Optional[datetime] = None
+    expectedOutcome: Optional[str] = None
+    risk: Optional[str] = None
+    rollbackPlan: Optional[str] = None
     sourceSegmentIds: list[str] = Field(default_factory=list)
     createdAt: datetime
     updatedAt: datetime
+
+class Conflict(BaseModel):
+    """PRD §10.3 — first-class contradiction record with its own review lifecycle."""
+    model_config = model_config
+    id: str
+    incidentId: str
+    claimA: str
+    claimB: str
+    status: ConflictStatus = "OPEN"
+    resolution: Optional[str] = None
+    verificationRequired: bool = True
+    relatedIds: list[str] = Field(default_factory=list)
+    detectedAt: datetime
+    resolvedAt: Optional[datetime] = None
 
 class ActionItem(BaseModel):
     model_config = model_config
@@ -157,6 +179,7 @@ class IncidentSnapshot(BaseModel):
     hypotheses: list[Hypothesis] = Field(default_factory=list)
     decisions: list[Decision] = Field(default_factory=list)
     actions: list[ActionItem] = Field(default_factory=list)
+    conflicts: list[Conflict] = Field(default_factory=list)
     gaps: list[Gap] = Field(default_factory=list)
     timeline: list[TimelineEvent] = Field(default_factory=list)
     transcript: list[TranscriptSegment] = Field(default_factory=list)

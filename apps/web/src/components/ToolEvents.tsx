@@ -10,6 +10,7 @@ const statusDot: Record<string, string> = {
 
 function ToolEventRow({ te }: { te: ToolEvent }) {
   const result = te.result as Record<string, unknown> | undefined;
+  const resultKey = result?.key != null ? String(result.key) : null;
   return (
     <div className="flex items-center gap-2 py-1 px-2 hover:bg-zinc-800/50 text-xs">
       <div className={`w-2 h-2 rounded-full ${statusDot[te.status] ?? "bg-zinc-600"}`} />
@@ -18,8 +19,8 @@ function ToolEventRow({ te }: { te: ToolEvent }) {
       {te.requiresApproval && (
         <span className="text-[10px] px-1 py-0.5 bg-orange-900/50 text-orange-300">⚠️</span>
       )}
-      {result?.key && (
-        <span className="text-[10px] font-mono text-blue-400">{String(result.key)}</span>
+      {resultKey && (
+        <span className="text-[10px] font-mono text-blue-400">{resultKey}</span>
       )}
     </div>
   );

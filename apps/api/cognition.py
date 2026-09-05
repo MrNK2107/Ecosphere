@@ -66,12 +66,39 @@ _EXTRACTOR_PROMPT = _load_extractor_prompt()
 _SUMMARY_PROMPT = _load_summary_prompt()
 
 # ---------------------------------------------------------------------------
-# OpenAI config
+# LLM config — PRD names Claude as the primary LLM layer; OpenAI kept as an
+# opt-in alternate provider for whoever's environment only has an OpenAI key.
 # ---------------------------------------------------------------------------
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL_EXTRACT = os.getenv("ANTHROPIC_MODEL_EXTRACT", "claude-sonnet-5")
+ANTHROPIC_MODEL_SUMMARY = os.getenv("ANTHROPIC_MODEL_SUMMARY", "claude-opus-5")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL_EXTRACT = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o")
-LLM_ENABLED = bool(OPENAI_API_KEY)
+
+# LLM_PROVIDER=claude|openai — explicit override; otherwise prefer Claude when
+# its key is present (PRD default), fall back to OpenAI if only that key is set.
+_PROVIDER_OVERRIDE = os.getenv("LLM_PROVIDER", "").strip().lower()
+if _PROVIDER_OVERRIDE in ("claude", "anthropic"):
+    LLM_PROVIDER = "claude"
+elif _PROVIDER_OVERRIDE == "openai":
+    LLM_PROVIDER = "openai"
+elif ANTHROPIC_API_KEY:
+    LLM_PROVIDER = "claude"
+elif OPENAI_API_KEY:
+    LLM_PROVIDER = "openai"
+else:
+    LLM_PROVIDER = "claude"  # irrelevant when no key is set; LLM_ENABLED gates the call
+
+LLM_ENABLED = bool(ANTHROPIC_API_KEY or OPENAI_API_KEY)
+
+try:
+    import anthropic  # type: ignore
+    _anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+except Exception:
+    anthropic = None  # type: ignore
+    _anthropic_client = None
 
 
 def _now() -> datetime:
@@ -83,8 +110,123 @@ def _gen_id(prefix: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM extraction (async, calls OpenAI)
+# Structured-output JSON schemas (mirror prompts/extractor.yaml and
+# prompts/summary.yaml output_schema; used for Claude's output_config.format)
 # ---------------------------------------------------------------------------
+EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "extractions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["Fact", "Hypothesis", "Decision", "ActionItem", "Chatter"]},
+                    "statement": {"type": "string"},
+                    "title": {"type": ["string", "null"]},
+                    "status": {"type": ["string", "null"]},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "sourceSegmentIds": {"type": "array", "items": {"type": "string"}},
+                    "ownerName": {"type": ["string", "null"]},
+                    "ownerRole": {"type": ["string", "null"]},
+                    "requiresConfirmation": {"type": "boolean"},
+                    "toolKey": {"type": ["string", "null"], "enum": ["jira", "slack", "pagerduty", "datadog", "github", None]},
+                    "dueAt": {"type": ["string", "null"]},
+                },
+                "required": [
+                    "kind", "statement", "title", "status", "confidence", "sourceSegmentIds",
+                    "ownerName", "ownerRole", "requiresConfirmation", "toolKey", "dueAt",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["extractions"],
+    "additionalProperties": False,
+}
+
+SUMMARY_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "markdown": {"type": "string"},
+        "ttsScript": {"type": "string"},
+        "unresolvedRisks": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["markdown", "ttsScript", "unresolvedRisks"],
+    "additionalProperties": False,
+}
+
+
+# ---------------------------------------------------------------------------
+# LLM calls — Claude (primary) and OpenAI (alternate provider)
+# ---------------------------------------------------------------------------
+async def _call_claude(system: str, user: str, model: str, json_schema: dict[str, Any]) -> str:
+    """Call Claude via the Anthropic SDK with structured JSON output. Returns raw JSON text."""
+    if _anthropic_client is None:
+        raise RuntimeError("Anthropic client not configured (ANTHROPIC_API_KEY missing)")
+    response = await _anthropic_client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+        output_config={"format": {"type": "json_schema", "schema": json_schema}},
+    )
+    text_block = next((b for b in response.content if b.type == "text"), None)
+    if text_block is None:
+        raise RuntimeError("Claude response contained no text block")
+    return text_block.text
+
+
+VOICE_REPLY_SYSTEM_PROMPT = (
+    "You are EchoSphere, an AI Incident Commander joining a live incident-response voice call as "
+    "a participant (PRD FR-03/FR-07). You are NOT a general chatbot — you are here to help the "
+    "team run the incident. Rules: keep replies to 1-3 short sentences suitable for text-to-speech "
+    "playback in a live call; never invent facts, root causes, or metrics you were not told; if "
+    "asked for a status update and you don't have enough context, say so plainly; never claim an "
+    "action was taken unless it was explicitly confirmed in the conversation; stay calm, concise, "
+    "and professional — this is a live SEV1-4 incident, not small talk."
+)
+
+
+async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[str] = None) -> str:
+    """
+    Plain-text conversational reply for the Agora Conversational AI custom-LLM webhook
+    (apps/api/agora_conversational_ai.py). Distinct from extract_llm/generate_summary: this is
+    the AI's spoken voice in the room, not the structured Fact/Hypothesis/Decision extraction
+    pipeline (which is fed separately via POST /incidents/{id}/transcript).
+    """
+    if not LLM_ENABLED:
+        return "I'm here, but my language model isn't configured yet — check ANTHROPIC_API_KEY."
+    model = model or ANTHROPIC_MODEL_EXTRACT
+    # messages arrive in OpenAI chat format ({role, content}); Claude's Messages API wants
+    # role in {user, assistant} only — fold any embedded "system" turns into user context.
+    claude_messages = []
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        if content:
+            claude_messages.append({"role": role, "content": str(content)})
+    if not claude_messages:
+        claude_messages = [{"role": "user", "content": "(no transcript yet)"}]
+    try:
+        if LLM_PROVIDER == "claude" and _anthropic_client is not None:
+            response = await _anthropic_client.messages.create(
+                model=model, max_tokens=300, system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
+            )
+            text_block = next((b for b in response.content if b.type == "text"), None)
+            return text_block.text if text_block else ""
+        else:
+            # _call_openai only takes a single system+user turn; fold history into one user string.
+            history_text = "\n".join(f"{m['role']}: {m['content']}" for m in claude_messages)
+            content = await _call_openai(VOICE_REPLY_SYSTEM_PROMPT, history_text, model=OPENAI_MODEL_EXTRACT)
+            return content
+    except Exception as e:
+        logger.warning(f"generate_voice_reply failed: {e}")
+        return "Sorry, I couldn't process that just now."
+
+
 async def _call_openai(system: str, user: str, model: str = "", temperature: float = 0) -> str:
     """Call OpenAI chat completions API. Returns response content string."""
     model = model or OPENAI_MODEL_EXTRACT
@@ -150,9 +292,14 @@ async def extract_llm(
 
     try:
         t0 = time.monotonic()
-        content = await _call_openai(system_prompt, user_message, model=OPENAI_MODEL_EXTRACT)
+        if LLM_PROVIDER == "claude":
+            content = await _call_claude(system_prompt, user_message, ANTHROPIC_MODEL_EXTRACT, EXTRACTION_JSON_SCHEMA)
+            model_used = ANTHROPIC_MODEL_EXTRACT
+        else:
+            content = await _call_openai(system_prompt, user_message, model=OPENAI_MODEL_EXTRACT)
+            model_used = OPENAI_MODEL_EXTRACT
         elapsed = time.monotonic() - t0
-        logger.info(f"LLM extraction: {elapsed:.2f}s, model={OPENAI_MODEL_EXTRACT}")
+        logger.info(f"LLM extraction: {elapsed:.2f}s, provider={LLM_PROVIDER}, model={model_used}")
 
         result = json.loads(content)
         if "extractions" not in result:
@@ -396,7 +543,10 @@ async def _generate_summary_llm(snapshot: dict[str, Any]) -> dict[str, Any]:
     ]
 
     try:
-        content = await _call_openai(system_prompt, "\n".join(user_parts), model=OPENAI_MODEL_SUMMARY, temperature=0.3)
+        if LLM_PROVIDER == "claude":
+            content = await _call_claude(system_prompt, "\n".join(user_parts), ANTHROPIC_MODEL_SUMMARY, SUMMARY_JSON_SCHEMA)
+        else:
+            content = await _call_openai(system_prompt, "\n".join(user_parts), model=OPENAI_MODEL_SUMMARY, temperature=0.3)
         result = json.loads(content)
         return {
             "markdown": result.get("markdown", ""),

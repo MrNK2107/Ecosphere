@@ -8,6 +8,11 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+test.db
+test_demo.db
+demo_run.db
+*.sqlite3
+.env.demo
 
 # env
 .env
@@ -22,6 +27,9 @@ Thumbs.db
 
 # python
 *.egg-info/
+
+# downloaded model cache
+apps/worker/silero_vad.onnx
 
 # logs
 logs/

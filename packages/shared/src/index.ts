@@ -19,8 +19,14 @@ export type DecisionStatus = z.infer<typeof DecisionStatus>;
 export const ActionStatus = z.enum(["Open", "InProgress", "Blocked", "Done", "Overdue"]);
 export type ActionStatus = z.infer<typeof ActionStatus>;
 
-export const GapKind = z.enum(["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction"]);
+export const GapKind = z.enum(["MissingOwner", "ConflictingInfo", "UnverifiedAssumption", "StaleAction", "AssumptionCreep", "DuplicateWork", "DecisionHygiene"]);
 export type GapKind = z.infer<typeof GapKind>;
+
+export const VerificationStatus = z.enum(["verified", "contradicted", "unverified", "unknown", "unavailable"]);
+export type VerificationStatus = z.infer<typeof VerificationStatus>;
+
+export const ConflictStatus = z.enum(["OPEN", "UNDER_REVIEW", "RESOLVED", "DISMISSED"]);
+export type ConflictStatus = z.infer<typeof ConflictStatus>;
 
 export const TimelineEventType = z.enum([
   "transcript",
@@ -90,6 +96,7 @@ export const FactSchema = z.object({
   statement: z.string().min(1).describe("concise factual claim"),
   status: FactStatus,
   confidence: z.number().min(0).max(1),
+  verificationStatus: VerificationStatus.default("unverified").describe("PRD §9.1 monitoring-verification outcome"),
   sourceSegmentIds: z.array(uuidId).min(1).describe("utteranceIds that support this fact"),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
@@ -104,6 +111,8 @@ export const HypothesisSchema = z.object({
   statement: z.string().min(1),
   status: HypothesisStatus,
   confidence: z.number().min(0).max(1),
+  verificationStatus: VerificationStatus.default("unverified"),
+  referenceCount: z.number().int().nonnegative().default(1).describe("PRD §8.5 assumption-creep: times referenced/reinforced"),
   sourceSegmentIds: z.array(uuidId).default([]),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
@@ -119,11 +128,29 @@ export const DecisionSchema = z.object({
   status: DecisionStatus,
   decidedBy: z.string().optional().describe("participant id or name"),
   decidedAt: isoDateTime.optional(),
+  expectedOutcome: z.string().optional().describe("PRD §8.9 decision hygiene"),
+  risk: z.string().optional(),
+  rollbackPlan: z.string().optional(),
   sourceSegmentIds: z.array(uuidId).default([]),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
 });
 export type Decision = z.infer<typeof DecisionSchema>;
+
+// ── Conflict ────────────────────────────────────────────────────────────────
+export const ConflictSchema = z.object({
+  id: uuidId,
+  incidentId: uuidId,
+  claimA: z.string().min(1),
+  claimB: z.string().min(1),
+  status: ConflictStatus.default("OPEN"),
+  resolution: z.string().optional(),
+  verificationRequired: z.boolean().default(true),
+  relatedIds: z.array(uuidId).default([]),
+  detectedAt: isoDateTime,
+  resolvedAt: isoDateTime.nullable().optional(),
+});
+export type Conflict = z.infer<typeof ConflictSchema>;
 
 // ── ActionItem ──────────────────────────────────────────────────────────────
 export const ActionItemSchema = z.object({
@@ -207,6 +234,7 @@ export const IncidentSnapshotSchema = z.object({
   hypotheses: z.array(HypothesisSchema),
   decisions: z.array(DecisionSchema),
   actions: z.array(ActionItemSchema),
+  conflicts: z.array(ConflictSchema),
   gaps: z.array(GapSchema),
   timeline: z.array(TimelineEventSchema),
   transcript: z.array(TranscriptSegmentSchema),
@@ -224,6 +252,7 @@ export const Schemas = {
   Hypothesis: HypothesisSchema,
   Decision: DecisionSchema,
   ActionItem: ActionItemSchema,
+  Conflict: ConflictSchema,
   Gap: GapSchema,
   ToolEvent: ToolEventSchema,
   TimelineEvent: TimelineEventSchema,

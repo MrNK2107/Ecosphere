@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .models import Base
+from models import Base
 
 logger = logging.getLogger("agora.db")
 
@@ -38,12 +38,12 @@ def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
         url = get_database_url()
+        pool_kwargs = {} if url.startswith("sqlite") else {"pool_size": 5, "max_overflow": 10}
         _engine = create_async_engine(
             url,
             echo=False,
-            pool_size=5,
-            max_overflow=10,
             pool_pre_ping=True,
+            **pool_kwargs,
         )
         logger.info(f"Created async engine: {url.split('@')[-1] if '@' in url else url}")
     return _engine
@@ -64,6 +64,14 @@ async def init_db() -> None:
     """Create all tables on startup."""
     engine = get_engine()
     async with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            # PRD §8.10 Cross-Incident Memory — enables the native `vector` column type used by
+            # Hypothesis.embedding (models.py). No-op / already-present on repeat startups.
+            try:
+                from sqlalchemy import text
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            except Exception as e:
+                logger.warning(f"Could not enable pgvector extension (non-fatal): {e}")
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables created/verified")
 

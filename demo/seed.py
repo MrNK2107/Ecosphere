@@ -58,7 +58,7 @@ def ensure_incident(api_url: str, fixture: dict) -> str:
         return fixture["incident"]["id"]
     inc = fixture["incident"]
     try:
-        r = httpx.post(f"{api_url}/incidents", json={"title": inc["title"], "severity": inc["severity"]}, timeout=10)
+        r = httpx.post(f"{api_url}/incidents", json={"id": inc["id"], "title": inc["title"], "severity": inc["severity"]}, timeout=10)
         if r.status_code < 400:
             j = r.json()
             print(f"Created incident {j.get('id')}")

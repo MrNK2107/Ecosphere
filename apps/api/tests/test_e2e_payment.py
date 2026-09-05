@@ -6,9 +6,10 @@ Validates: 4 facts, 1 hypothesis, 1 decision, 2 actions, conflict gap, approval 
 import json
 import pathlib
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
-FIXTURE_PATH = pathlib.Path(__file__).parent.parent.parent / "demo" / "payment_outage.json"
+FIXTURE_PATH = pathlib.Path(__file__).parent.parent.parent.parent / "demo" / "payment_outage.json"
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def fixture():
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def seeded_incident(client: AsyncClient, fixture):
     """Create incident, add participants, replay fixture, return incident_id."""
     # Create incident

@@ -4,7 +4,7 @@ import { create } from "zustand";
 export type Incident = {
   id: string; title: string; severity: "SEV1" | "SEV2" | "SEV3" | "SEV4";
   status: string; description?: string;
-  participants: { id: string; name: string; role: string; avatarUrl?: string }[];
+  participants: { id: string; name: string; role: string; avatarUrl?: string; joinedAt: string; isBot: boolean }[];
   summaryMarkdown?: string; createdAt: string; updatedAt: string;
 };
 export type TranscriptSegment = {

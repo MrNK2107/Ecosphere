@@ -13,5 +13,8 @@ websockets==12.0
 pytest==8.2.0
 pytest-asyncio==0.23.6
 pytest-cov==5.0.0
+aiosqlite==0.20.0
 # Cognition
 pyyaml==6.0.1
+anthropic==1.4.0
+pgvector==0.5.0
