@@ -51,21 +51,26 @@ def post_transcript(api_url: str, incident_id: str, utterance: dict) -> bool:
         print(f"POST {utterance['id']} failed: {e}", file=sys.stderr)
         return False
 
-def ensure_incident(api_url: str, fixture: dict) -> str:
+def ensure_incident(api_url: str, fixture: dict, incident_id: str) -> str:
+    """Create (or reuse) the incident under the requested id — NOT the fixture's own baked-in
+    id — so `--incident my-custom-id` actually targets that id. Safe to reuse the same fixture's
+    utterance ids (u-001..u-012) across different incident ids: transcript segment uniqueness is
+    scoped per-incident (see apps/api/models.py TranscriptSegmentModel), and the deterministic
+    cognition fixture-map keys off the utterance id content, not the incident id."""
     try:
         import httpx
     except ImportError:
-        return fixture["incident"]["id"]
+        return incident_id
     inc = fixture["incident"]
     try:
-        r = httpx.post(f"{api_url}/incidents", json={"id": inc["id"], "title": inc["title"], "severity": inc["severity"]}, timeout=10)
+        r = httpx.post(f"{api_url}/incidents", json={"id": incident_id, "title": inc["title"], "severity": inc["severity"]}, timeout=10)
         if r.status_code < 400:
             j = r.json()
             print(f"Created incident {j.get('id')}")
-            return j.get("id", inc["id"])
+            return j.get("id", incident_id)
     except Exception as e:
         print(f"ensure_incident skipped: {e}")
-    return inc["id"]
+    return incident_id
 
 def main():
     parser = argparse.ArgumentParser(description="Agora demo seeder")
@@ -81,7 +86,7 @@ def main():
     utterances = fixture.get("utterances", [])
 
     if not args.dry_run:
-        incident_id = ensure_incident(args.api_url, fixture)
+        incident_id = ensure_incident(args.api_url, fixture, incident_id)
         print(f"Seeding to {args.api_url} incident={incident_id} rate={args.replay_rate}x")
 
     prev_start = None

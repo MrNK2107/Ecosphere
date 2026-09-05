@@ -837,7 +837,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
     kind = fixture_map.get(sid)
 
     if kind == "fact:12pct":
-        fid = f"fact-{sid}"
+        fid = f"fact-{incident_id}-{sid}"
         existing = await session.get(FactModel, fid)
         if not existing:
             f = FactModel(
@@ -852,7 +852,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "fact:replica":
-        fid = f"fact-{sid}"
+        fid = f"fact-{incident_id}-{sid}"
         existing = await session.get(FactModel, fid)
         if not existing:
             f = FactModel(
@@ -867,7 +867,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "fact:5xx":
-        fid = f"fact-{sid}"
+        fid = f"fact-{incident_id}-{sid}"
         existing = await session.get(FactModel, fid)
         if not existing:
             f = FactModel(
@@ -882,7 +882,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "hypothesis:deploy":
-        hid = f"hypo-{sid}"
+        hid = f"hypo-{incident_id}-{sid}"
         existing = await session.get(HypothesisModel, hid)
         if not existing:
             h = HypothesisModel(
@@ -897,7 +897,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "fact:tickets":
-        fid = f"fact-{sid}"
+        fid = f"fact-{incident_id}-{sid}"
         existing = await session.get(FactModel, fid)
         if not existing:
             f = FactModel(
@@ -912,7 +912,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "decision:rollback":
-        did = f"decision-{sid}"
+        did = f"decision-{incident_id}-{sid}"
         existing = await session.get(DecisionModel, did)
         if not existing:
             d = DecisionModel(
@@ -928,7 +928,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "fact:2pct":
-        fid = f"fact-{sid}"
+        fid = f"fact-{incident_id}-{sid}"
         existing = await session.get(FactModel, fid)
         if not existing:
             f = FactModel(
@@ -943,7 +943,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "action:jira":
-        aid = "action-jira-replica"
+        aid = f"action-jira-replica-{incident_id}"
         existing = await session.get(ActionItemModel, aid)
         if not existing:
             a = ActionItemModel(
@@ -973,7 +973,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
         return
 
     if kind == "action:comms":
-        aid = "action-comms"
+        aid = f"action-comms-{incident_id}"
         existing = await session.get(ActionItemModel, aid)
         if not existing:
             a = ActionItemModel(
@@ -992,7 +992,7 @@ async def _run_cognition(session: AsyncSession, segment: TranscriptSegmentModel,
 
     # u-011: update jira action to require confirmation
     if sid == "u-011":
-        aid = "action-jira-replica"
+        aid = f"action-jira-replica-{incident_id}"
         act = await session.get(ActionItemModel, aid)
         if act:
             act.requires_confirmation = True
