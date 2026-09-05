@@ -72,6 +72,29 @@ def ensure_incident(api_url: str, fixture: dict, incident_id: str) -> str:
         print(f"ensure_incident skipped: {e}")
     return incident_id
 
+
+def seed_participants(api_url: str, fixture: dict, incident_id: str) -> None:
+    """PS41 requirement #2 'Recognition of participant roles' needs an actual roster, not just
+    per-utterance speakerName/role fields on the transcript. This was previously never called —
+    the participant list stayed empty even though the fixture defines one."""
+    try:
+        import httpx
+    except ImportError:
+        return
+    for p in fixture.get("participants", []):
+        try:
+            r = httpx.post(
+                f"{api_url}/incidents/{incident_id}/participants",
+                json={"id": p["id"], "name": p["name"], "role": p.get("role", "Unknown")},
+                timeout=10,
+            )
+            if r.status_code < 400:
+                print(f"Added participant {p['name']} ({p.get('role', 'Unknown')})")
+            else:
+                print(f"seed_participants: {p['name']} -> {r.status_code} {r.text[:120]}")
+        except Exception as e:
+            print(f"seed_participants skipped {p.get('name')}: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Agora demo seeder")
     parser.add_argument("--incident", default="payment-001", help="incident id to seed into")
@@ -87,6 +110,7 @@ def main():
 
     if not args.dry_run:
         incident_id = ensure_incident(args.api_url, fixture, incident_id)
+        seed_participants(args.api_url, fixture, incident_id)
         print(f"Seeding to {args.api_url} incident={incident_id} rate={args.replay_rate}x")
 
     prev_start = None

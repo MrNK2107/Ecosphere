@@ -64,10 +64,13 @@ class IncidentModel(Base):
 
 class ParticipantModel(Base):
     __tablename__ = "participants"
+    # Composite PK: fixture participant ids (e.g. "p-priya") are only unique per incident, not
+    # globally — same bug class as TranscriptSegmentModel (see models.py note there). A global
+    # PK on `id` alone broke re-seeding the same fixture into a second incident.
     __table_args__ = (UniqueConstraint("incident_id", "name", name="uq_participant_incident_name"),)
 
     id = Column(String(64), primary_key=True)
-    incident_id = Column(String(64), ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False, index=True)
+    incident_id = Column(String(64), ForeignKey("incidents.id", ondelete="CASCADE"), primary_key=True, index=True)
     name = Column(String(256), nullable=False)
     role = Column(String(32), nullable=False, default="Unknown")
     avatar_url = Column(String(1024), nullable=True)

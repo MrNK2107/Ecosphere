@@ -1464,6 +1464,9 @@ async def add_participant(incident_id: str, body: ParticipantCreate, session: As
         raise HTTPException(status_code=404, detail="incident not found")
     now = _now()
     pid = body.id or _gen_id("p")
+    existing = await session.get(ParticipantModel, (pid, incident_id))
+    if existing is not None:
+        return _model_to_participant(existing)
     p = ParticipantModel(
         id=pid, incident_id=incident_id, name=body.name,
         role=body.role or "Unknown", avatar_url=body.avatarUrl,

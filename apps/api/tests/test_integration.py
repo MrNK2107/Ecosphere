@@ -68,6 +68,31 @@ class TestParticipants:
         assert r.json()["name"] == "Priya"
         assert r.json()["role"] == "SRE"
 
+    async def test_same_participant_id_across_two_incidents_does_not_collide(self, client: AsyncClient):
+        """demo/seed.py's fixture uses fixed participant ids (e.g. "p-priya") regardless of
+        which incident it's seeded into — a global PK on ParticipantModel.id broke this."""
+        inc1 = (await client.post("/incidents", json={"title": "Incident A"})).json()["id"]
+        inc2 = (await client.post("/incidents", json={"title": "Incident B"})).json()["id"]
+
+        r1 = await client.post(f"/incidents/{inc1}/participants", json={"id": "p-priya", "name": "Priya", "role": "SRE"})
+        assert r1.status_code == 200
+        r2 = await client.post(f"/incidents/{inc2}/participants", json={"id": "p-priya", "name": "Priya", "role": "SRE"})
+        assert r2.status_code == 200
+
+        snap1 = (await client.get(f"/incidents/{inc1}/snapshot")).json()
+        snap2 = (await client.get(f"/incidents/{inc2}/snapshot")).json()
+        assert len(snap1["incident"]["participants"]) == 1
+        assert len(snap2["incident"]["participants"]) == 1
+
+    async def test_re_adding_same_participant_is_idempotent(self, client: AsyncClient):
+        create_r = await client.post("/incidents", json={"title": "Idempotent Participant Test"})
+        inc_id = create_r.json()["id"]
+        for _ in range(2):
+            r = await client.post(f"/incidents/{inc_id}/participants", json={"id": "p-priya", "name": "Priya", "role": "SRE"})
+            assert r.status_code == 200
+        snap = (await client.get(f"/incidents/{inc_id}/snapshot")).json()
+        assert len(snap["incident"]["participants"]) == 1
+
 
 @pytest.mark.asyncio
 class TestTranscriptIngestion:

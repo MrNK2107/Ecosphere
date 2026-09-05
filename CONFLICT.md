@@ -81,7 +81,33 @@ Everything else (fixing bugs, building missing pieces like the spoken-summary sc
 monitoring verification) I can do without waiting on you. The plan below sequences it so the
 disqualification-risk item comes first.
 
-## 5. One more thing worth flagging, not acting on
+## 5. Live-verified this round (full reset, fresh DB, real requests — not just unit tests)
+
+- Core extraction/state (facts, hypotheses, decisions, ownership, conflicts, gaps) — confirmed
+  live, correct counts.
+- **Fixed a real gap**: `demo/seed.py` never added participants at all — the roster (PS41 #2,
+  "recognition of participant roles") was empty even though the fixture defines 4 people with
+  roles. Also found and fixed the same global-ID-collision bug class as before, this time on
+  `ParticipantModel` (fixture participant ids like `p-priya` aren't unique across incidents).
+  Both fixed and tested (85 tests passing now, up from 83).
+- Approval gate → real tool adapter dispatch — confirmed (mock Jira ticket created correctly,
+  respects the action's actual `tool_key`).
+- Final summary generation — confirmed, includes timeline/facts/risks section.
+- Spoken-summary scheduler — confirmed firing and recording a timeline entry with the correct
+  grounded script text.
+- WebSocket live snapshot delivery — confirmed.
+- Agora agent join/leave — confirmed correct in mock mode (no live account yet).
+- Custom-LLM webhook — confirmed context-routing works (finds the right incident) and streams.
+
+**New finding, important**: with `LLM_PROVIDER=ollama` (local `llama3.1:8b`, CPU), a single voice
+reply through the custom-LLM webhook took **~33 seconds**. That's unusable for real-time voice —
+Agora's engine almost certainly has its own timeout well under that, and even if it didn't, a
+33-second silence mid-conversation fails "real-time voice interaction" outright. **Recommendation:
+use Claude or OpenAI (not Ollama) for `LLM_PROVIDER` on the live-voice path** once an Anthropic/
+OpenAI key is available — Ollama is fine for the text-only extraction path (where a few extra
+seconds doesn't break a live conversation) but not for `generate_voice_reply_stream`.
+
+## 6. One more thing worth flagging, not acting on
 
 The page I fetched shows submissions closing **Sep 4, 11:59 PM IST**, and today is Sep 5 per this
 session's clock. I'm not treating this as settled — dates get extended, and you're clearly still
