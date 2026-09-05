@@ -42,6 +42,7 @@ export const TimelineEventType = z.enum([
   "tool",
   "summary",
   "system",
+  "spoken_summary",
 ]);
 export type TimelineEventType = z.infer<typeof TimelineEventType>;
 

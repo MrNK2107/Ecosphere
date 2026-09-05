@@ -18,7 +18,7 @@ TimelineEventType = Literal[
     "transcript", "fact_created", "fact_updated",
     "hypothesis_created", "hypothesis_updated",
     "decision", "action_created", "action_updated",
-    "gap_detected", "gap_resolved", "tool", "summary", "system"
+    "gap_detected", "gap_resolved", "tool", "summary", "system", "spoken_summary"
 ]
 ToolName = Literal["jira", "slack", "pagerduty", "datadog", "github"]
 ToolEventStatus = Literal["pending", "success", "failed", "requiresApproval", "rejected"]
