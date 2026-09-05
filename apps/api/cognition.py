@@ -66,8 +66,9 @@ _EXTRACTOR_PROMPT = _load_extractor_prompt()
 _SUMMARY_PROMPT = _load_summary_prompt()
 
 # ---------------------------------------------------------------------------
-# LLM config — PRD names Claude as the primary LLM layer; OpenAI kept as an
-# opt-in alternate provider for whoever's environment only has an OpenAI key.
+# LLM config — PRD names Claude as the primary LLM layer; OpenAI and a local Ollama server
+# are kept as opt-in alternate providers for environments without an Anthropic key (e.g. a
+# laptop running Ollama with no cloud API keys at all).
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL_EXTRACT = os.getenv("ANTHROPIC_MODEL_EXTRACT", "claude-sonnet-5")
@@ -77,13 +78,22 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL_EXTRACT = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o")
 
-# LLM_PROVIDER=claude|openai — explicit override; otherwise prefer Claude when
-# its key is present (PRD default), fall back to OpenAI if only that key is set.
+# Ollama — local, no API key required. Needs `ollama serve` running (default port 11434) and
+# the model already pulled (`ollama pull llama3.1:8b`).
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL_EXTRACT = os.getenv("OLLAMA_MODEL_EXTRACT", "llama3.1:8b")
+OLLAMA_MODEL_SUMMARY = os.getenv("OLLAMA_MODEL_SUMMARY", "llama3.1:8b")
+
+# LLM_PROVIDER=claude|openai|ollama — explicit override; otherwise prefer Claude when its key
+# is present, OpenAI if only that key is set. Ollama needs no key, so it's never auto-selected —
+# it must be requested explicitly (LLM_PROVIDER=ollama) to avoid a silent probe-and-guess.
 _PROVIDER_OVERRIDE = os.getenv("LLM_PROVIDER", "").strip().lower()
 if _PROVIDER_OVERRIDE in ("claude", "anthropic"):
     LLM_PROVIDER = "claude"
 elif _PROVIDER_OVERRIDE == "openai":
     LLM_PROVIDER = "openai"
+elif _PROVIDER_OVERRIDE in ("ollama", "local"):
+    LLM_PROVIDER = "ollama"
 elif ANTHROPIC_API_KEY:
     LLM_PROVIDER = "claude"
 elif OPENAI_API_KEY:
@@ -91,7 +101,7 @@ elif OPENAI_API_KEY:
 else:
     LLM_PROVIDER = "claude"  # irrelevant when no key is set; LLM_ENABLED gates the call
 
-LLM_ENABLED = bool(ANTHROPIC_API_KEY or OPENAI_API_KEY)
+LLM_ENABLED = bool(ANTHROPIC_API_KEY or OPENAI_API_KEY or LLM_PROVIDER == "ollama")
 
 try:
     import anthropic  # type: ignore
@@ -196,10 +206,9 @@ async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[s
     pipeline (which is fed separately via POST /incidents/{id}/transcript).
     """
     if not LLM_ENABLED:
-        return "I'm here, but my language model isn't configured yet — check ANTHROPIC_API_KEY."
-    model = model or ANTHROPIC_MODEL_EXTRACT
-    # messages arrive in OpenAI chat format ({role, content}); Claude's Messages API wants
-    # role in {user, assistant} only — fold any embedded "system" turns into user context.
+        return "I'm here, but no language model is configured yet — set LLM_PROVIDER and a key, or LLM_PROVIDER=ollama for a local model."
+    # messages arrive in OpenAI chat format ({role, content}); fold any embedded "system" turns
+    # into user context since Claude's Messages API only allows {user, assistant} roles.
     claude_messages = []
     for m in messages:
         role = "assistant" if m.get("role") == "assistant" else "user"
@@ -213,15 +222,18 @@ async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[s
     try:
         if LLM_PROVIDER == "claude" and _anthropic_client is not None:
             response = await _anthropic_client.messages.create(
-                model=model, max_tokens=300, system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
+                model=model or ANTHROPIC_MODEL_EXTRACT, max_tokens=300,
+                system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
             )
             text_block = next((b for b in response.content if b.type == "text"), None)
             return text_block.text if text_block else ""
+        elif LLM_PROVIDER == "ollama":
+            history_text = "\n".join(f"{m['role']}: {m['content']}" for m in claude_messages)
+            return await _call_ollama(VOICE_REPLY_SYSTEM_PROMPT, history_text, model=model or OLLAMA_MODEL_EXTRACT, json_mode=False)
         else:
             # _call_openai only takes a single system+user turn; fold history into one user string.
             history_text = "\n".join(f"{m['role']}: {m['content']}" for m in claude_messages)
-            content = await _call_openai(VOICE_REPLY_SYSTEM_PROMPT, history_text, model=OPENAI_MODEL_EXTRACT)
-            return content
+            return await _call_openai(VOICE_REPLY_SYSTEM_PROMPT, history_text, model=model or OPENAI_MODEL_EXTRACT)
     except Exception as e:
         logger.warning(f"generate_voice_reply failed: {e}")
         return "Sorry, I couldn't process that just now."
@@ -246,6 +258,31 @@ async def _call_openai(system: str, user: str, model: str = "", temperature: flo
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"]
+
+
+async def _call_ollama(system: str, user: str, model: str = "", json_mode: bool = True) -> str:
+    """Call a local Ollama server's native /api/chat endpoint. No API key needed.
+    `format: "json"` forces syntactically valid JSON but — unlike Claude's output_config or
+    OpenAI's json_schema — doesn't enforce our specific schema shape, so the system prompt
+    (extractor.yaml / summary.yaml) doing the schema description in plain text still matters."""
+    model = model or OLLAMA_MODEL_EXTRACT
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+    }
+    if json_mode:
+        payload["format"] = "json"
+    # Local inference (esp. on CPU) is much slower than a hosted API — generous timeout.
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["message"]["content"]
 
 
 async def extract_llm(
@@ -295,6 +332,20 @@ async def extract_llm(
         if LLM_PROVIDER == "claude":
             content = await _call_claude(system_prompt, user_message, ANTHROPIC_MODEL_EXTRACT, EXTRACTION_JSON_SCHEMA)
             model_used = ANTHROPIC_MODEL_EXTRACT
+        elif LLM_PROVIDER == "ollama":
+            # Ollama's format:json forces valid JSON syntax but not our schema shape (no
+            # json_schema-style enforcement like Claude/OpenAI) — spell the shape out explicitly,
+            # local models follow instructions less reliably than hosted frontier models.
+            ollama_system = system_prompt + (
+                "\n\nRespond with ONLY a JSON object of exactly this shape (no other text):\n"
+                '{"extractions": [{"kind": "Fact|Hypothesis|Decision|ActionItem|Chatter", '
+                '"statement": "...", "title": null, "status": "...", "confidence": 0.0-1.0, '
+                '"sourceSegmentIds": ["..."], "ownerName": null, "ownerRole": null, '
+                '"requiresConfirmation": false, "toolKey": null, "dueAt": null}]}\n'
+                "Use an empty extractions array for Chatter."
+            )
+            content = await _call_ollama(ollama_system, user_message, model=OLLAMA_MODEL_EXTRACT)
+            model_used = OLLAMA_MODEL_EXTRACT
         else:
             content = await _call_openai(system_prompt, user_message, model=OPENAI_MODEL_EXTRACT)
             model_used = OPENAI_MODEL_EXTRACT
@@ -545,6 +596,12 @@ async def _generate_summary_llm(snapshot: dict[str, Any]) -> dict[str, Any]:
     try:
         if LLM_PROVIDER == "claude":
             content = await _call_claude(system_prompt, "\n".join(user_parts), ANTHROPIC_MODEL_SUMMARY, SUMMARY_JSON_SCHEMA)
+        elif LLM_PROVIDER == "ollama":
+            ollama_system = system_prompt + (
+                '\n\nRespond with ONLY a JSON object of exactly this shape (no other text): '
+                '{"markdown": "...", "ttsScript": "...", "unresolvedRisks": ["..."]}'
+            )
+            content = await _call_ollama(ollama_system, "\n".join(user_parts), model=OLLAMA_MODEL_SUMMARY)
         else:
             content = await _call_openai(system_prompt, "\n".join(user_parts), model=OPENAI_MODEL_SUMMARY, temperature=0.3)
         result = json.loads(content)

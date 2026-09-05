@@ -24,7 +24,7 @@ from models import (
     FactModel, HypothesisModel, DecisionModel, ActionItemModel, ConflictModel,
     GapModel, TimelineEventModel, ToolEventModel, TimelineSeqModel,
 )
-from db import get_engine, init_db, close_db, get_db
+from db import get_engine, init_db, close_db, get_db, get_session_factory
 import tools
 import embeddings
 import cognition
@@ -1601,7 +1601,8 @@ async def generate_summary(incident_id: str, session: AsyncSession = Depends(get
 @app.websocket("/ws/incidents/{incident_id}")
 async def ws_timeline(websocket: WebSocket, incident_id: str):
     await websocket.accept()
-    async with get_db() as session:
+    session_factory = get_session_factory()
+    async with session_factory() as session:
         # Auto-create placeholder if not exists
         inc_m = await session.get(IncidentModel, incident_id)
         if not inc_m:
