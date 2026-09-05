@@ -1277,10 +1277,15 @@ async def agora_custom_llm(body: dict[str, Any] = Body(...)):
 @app.post("/incidents", tags=["incidents"])
 async def create_incident(body: IncidentCreate, session: AsyncSession = Depends(get_db)):
     now = _now()
-    iid = body.id or f"inc-{uuid.uuid4().hex[:8]}"
-    # Check uniqueness
-    existing = await session.get(IncidentModel, iid)
-    if existing:
+    if body.id:
+        # Caller asked for a specific id (e.g. demo/seed.py re-seeding "payment-001") — if it
+        # already exists, return it as-is instead of silently minting an unrelated random id,
+        # which broke re-running the demo against a persisted DB without a full reset.
+        existing = await session.get(IncidentModel, body.id)
+        if existing:
+            return await get_incident(body.id, session)
+        iid = body.id
+    else:
         iid = f"inc-{uuid.uuid4().hex[:8]}"
 
     inc = IncidentModel(

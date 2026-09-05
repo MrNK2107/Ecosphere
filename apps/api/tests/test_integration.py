@@ -16,6 +16,21 @@ class TestIncidentCRUD:
         assert data["severity"] == "SEV1"
         assert "id" in data
 
+    async def test_create_with_explicit_id_is_idempotent(self, client: AsyncClient):
+        """Re-POSTing the same explicit id (e.g. demo/seed.py re-seeding "payment-001") must
+        return the existing incident, not silently mint an unrelated random id."""
+        r1 = await client.post("/incidents", json={"id": "payment-001", "title": "Payment Outage"})
+        assert r1.status_code == 200
+        assert r1.json()["id"] == "payment-001"
+
+        r2 = await client.post("/incidents", json={"id": "payment-001", "title": "Payment Outage"})
+        assert r2.status_code == 200
+        assert r2.json()["id"] == "payment-001"
+
+        r3 = await client.get("/incidents")
+        ids = [i["id"] for i in r3.json()]
+        assert ids.count("payment-001") == 1
+
     async def test_list_incidents(self, client: AsyncClient):
         await client.post("/incidents", json={"title": "Incident 1"})
         await client.post("/incidents", json={"title": "Incident 2"})
