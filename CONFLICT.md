@@ -35,14 +35,12 @@ person can join a real Agora voice room and watch EchoSphere listen, classify, a
 
 | What | Where | Currently | Needed for "real" |
 |---|---|---|---|
-| Voice room | `apps/worker`, `agora_conversational_ai.py` | Never live-tested | Real `AGORA_APP_ID`/`AGORA_APP_CERT`/`AGORA_CUSTOMER_ID`/`AGORA_CUSTOMER_SECRET` |
+| Voice room | `apps/worker`, `agora_conversational_ai.py` | Never live-tested | Real `AGORA_APP_ID`/`AGORA_APP_CERT`/`AGORA_CUSTOMER_ID`/`AGORA_CUSTOMER_SECRET` — see `SETUP.md` |
 | STT | `apps/worker/main.py` | `MOCK_DEEPGRAM` fallback returns canned text | Real `DEEPGRAM_API_KEY`, or rely on Agora-managed ASR (needs Agora creds above) |
 | LLM classification | `cognition.py` | Real (Claude/OpenAI/Ollama all genuinely work) | Already real — not a mock |
-| TTS / spoken summaries | `apps/api/tts.py` | `TTS_PROVIDER=mock` → returns empty audio | Real `TTS_PROVIDER=openai` + key, or Agora-managed MiniMax (needs Agora creds) |
-| Jira | `apps/api/tools.py` `MockJira` | Fabricates a ticket key, no real API call | Real `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` |
-| Slack | `apps/api/tools.py` `MockSlack` | Logs only, no real message sent | Real `SLACK_TOKEN`/`SLACK_CHANNEL` |
-| PagerDuty | `apps/api/tools.py` `MockPD` | Fabricates a page, no real trigger | Real `PAGERDUTY_KEY`/`PAGERDUTY_SERVICE_ID` |
-| Datadog | `apps/api/tools.py` `MockDatadog` | Logs only | Real `DATADOG_API_KEY` (also needed for PRD §9.1 monitoring-verification, which was never built for real) |
+| TTS / spoken summaries | `apps/api/tts.py` + scheduler in `main.py` | Scheduler logic real and tested (5-min/3-facts cadence); audio synthesis mocked (empty) without a TTS key | Real `TTS_PROVIDER=openai` + key, or Agora-managed MiniMax (needs Agora creds) |
+| Jira / Slack / PagerDuty / Datadog | `apps/api/tools.py` | **Real HTTP adapters now built and tested** (request-shape verified); fall back to mock only when that service's credentials are unset | Fill in credentials per `SETUP.md` — code is ready, zero more coding needed once you have keys |
+| Monitoring verification (PRD §9.1) | `tools.query_datadog_metric()` | Function built, not yet wired into Fact.verification_status | Needs `DATADOG_API_KEY` + `DATADOG_APP_KEY`, then wiring (not started) |
 | Transcript source | `demo/seed.py` | Scripted fixture replay | Live speaker-attributed ASR from the voice room |
 
 ## 3. PS41's 10 required capabilities — honest status
@@ -55,14 +53,15 @@ person can join a real Agora voice room and watch EchoSphere listen, classify, a
 | 4 | Assignment and tracking of task ownership | **Real** — ActionItem.ownerName, tracked in state |
 | 5 | Detection of missing or conflicting information | **Real** — Gap/Conflict detection tested and working |
 | 6 | Continuously updated incident timeline | **Real** — timeline + live WebSocket push, verified working |
-| 7 | Integration with Jira/Slack/PagerDuty/monitoring | **Mocked only** — see table above, zero real calls ever made |
-| 8 | Spoken status summaries at appropriate moments | **Not real** — TTS is mocked, no scheduler exists that decides "now is a good moment to speak" |
+| 7 | Integration with Jira/Slack/PagerDuty/monitoring | **Code is real now**, credentials pending — adapters make genuine HTTP calls to each service's real API, tested at the request-shape level; currently running mocked only because no credentials are configured yet (see `SETUP.md`) |
+| 8 | Spoken status summaries at appropriate moments | **Scheduler is real and tested** (5-min cadence / 3-new-facts trigger, verified with real threshold tests) — the "appropriate moments" logic works; the audio itself is mocked (empty) until a TTS key is set, and it isn't yet published back into a live voice room (needs #1 first) |
 | 9 | Human confirmation before critical actions | **Real** — approval gate tested and working |
 | 10 | Final incident summary with unresolved risks | **Real** — summary generation tested and working |
 
-**Net: the "brain" (4/10 fully solid, 2 more nearly there) is genuinely good. The "live, voice,
-integrated" half of the requirement (1, 2, 7, 8) is the part that's actually missing**, and it's
-also exactly the half the disqualification criteria are about.
+**Net: 6/10 fully solid, 2 more (#7, #8) have real, tested code now and just need credentials to
+flip from mock to live — no more building required for those. What's genuinely still missing is
+#1 (live voice, blocked on your Agora account) and #2 (proving role recognition against real
+speech instead of the scripted fixture, which depends on #1).**
 
 ## 4. What I need from you to fix section 1 and 3
 
