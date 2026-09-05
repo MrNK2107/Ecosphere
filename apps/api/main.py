@@ -1194,8 +1194,8 @@ async def tools_status():
     def _s(key: str) -> str:
         return "live" if os.getenv(key) else "mock"
     return {
-        "jira": _s("JIRA_URL"), "slack": _s("SLACK_TOKEN"),
-        "pagerduty": _s("PAGERDUTY_KEY"), "datadog": _s("DATADOG_API_KEY"),
+        "jira": tools.adapter_mode("jira"), "slack": tools.adapter_mode("slack"),
+        "pagerduty": tools.adapter_mode("pagerduty"), "datadog": tools.adapter_mode("datadog"),
         "deepgram": _s("DEEPGRAM_API_KEY"), "agora": _s("AGORA_APP_ID"),
         "agora_conversational_ai": "live" if agora_conversational_ai.CAI_ENABLED else "mock",
     }
@@ -1466,17 +1466,24 @@ async def approve_action(incident_id: str, action_id: str, session: AsyncSession
     await _append_timeline(session, incident_id, "action_updated",
                            {"title": act.title, "status": act.status}, ref_id=action_id)
 
-    # Simulate tool event
+    # Dispatch the real (or mock, if no credentials configured) tool adapter — respects the
+    # action's actual tool_key instead of always simulating a Jira ticket.
+    tool_key = act.tool_key or "jira"
+    tool_action = {"jira": "create_issue", "github": "create_issue", "slack": "send_message",
+                   "pagerduty": "trigger_page", "datadog": "annotate"}.get(tool_key, "create_issue")
+    result = await tools.invoke_tool(
+        tool_key, tool_action, act.tool_payload or {"summary": act.title, "text": act.title},
+        {"incidentId": incident_id, "actionItemId": action_id, "requiresConfirmation": False, "action": tool_action},
+    )
     te = ToolEventModel(
-        id=_gen_id("tool"), incident_id=incident_id, tool=act.tool_key or "jira",
-        action="create_issue", status="success",
-        payload=act.tool_payload or {},
-        result={"key": f"PAY-{uuid.uuid4().hex[:4].upper()}", "url": f"https://jira.example.com/browse/PAY-{uuid.uuid4().hex[:4]}"},
+        id=result.get("id") or _gen_id("tool"), incident_id=incident_id, tool=tool_key,
+        action=tool_action, status=result.get("status", "success"),
+        payload=act.tool_payload or {}, result=result.get("result"),
         requires_approval=False, action_item_id=action_id, created_at=now,
     )
     session.add(te)
     await _append_timeline(session, incident_id, "tool",
-                           {"tool": te.tool, "action": te.action, "status": "success"}, ref_id=te.id)
+                           {"tool": te.tool, "action": te.action, "status": te.status}, ref_id=te.id)
 
     await _detect_and_store_gaps(session, incident_id)
     await session.flush()
