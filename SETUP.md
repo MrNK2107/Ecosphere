@@ -13,24 +13,23 @@ gap right now.
 1. Go to **console.agora.io** and sign up (free tier is enough for development/demo).
 2. Create a new project: **Console → Project Management → Create**.
    - Authentication mode: pick **App ID + Token** (not "Testing Mode" / App ID only — you need a
-     Certificate for token generation, which the worker already has code for).
+     Certificate for token generation).
 3. From that project, copy:
    - **App ID** → `AGORA_APP_ID`
    - **App Certificate** (click "Enable" if it's off, then copy it) → `AGORA_APP_CERT`
-4. Separately, generate REST API credentials (different from the App ID/Cert above — used for the
-   Conversational AI Engine and Signaling REST calls):
-   **Console → your project → Developer Toolkit → RESTful API → Add a secret / Basic Auth
-   Credentials.**
-   - Copy **Customer ID** → `AGORA_CUSTOMER_ID`
-   - Copy **Customer Secret** → `AGORA_CUSTOMER_SECRET`
-5. Enable **Conversational AI Engine** for the project if it's a separately-gated feature in the
+   - This is all the auth you need — our code uses the official `agora-agents` SDK in "App
+     Credentials" mode, which mints Conversational AI tokens internally per request. (There's
+     also a Customer ID/Secret "Basic Auth" mode under Developer Toolkit → RESTful API, which
+     Agora's own docs call "for testing only" — not needed unless you want that mode specifically.)
+4. Enable **Conversational AI Engine** for the project if it's a separately-gated feature in the
    console (check under the project's enabled products/add-ons — it may need to be turned on).
 
-Put all four values in `.env` (copy `.env.example` to `.env` first if you haven't).
+Put both values in `.env` (copy `.env.example` to `.env` first if you haven't).
 
-**Also needed just for this piece**: a **publicly reachable URL** for
-`POST /agora/llm/chat/completions` (`AGORA_CUSTOM_LLM_URL`) — Agora's servers call this over the
-internet, `localhost` won't work. Easiest option while developing:
+**Also needed just for this piece**: a **publicly reachable base URL** for our custom-LLM webhook
+(`AGORA_CUSTOM_LLM_URL`, e.g. `https://xxxx.ngrok.io/agora` — no `/chat/completions` suffix, the
+SDK appends that itself) — Agora's servers call this over the internet, `localhost` won't work.
+Easiest option while developing:
 ```powershell
 # in a new terminal, with the API running on :8000
 ngrok http 8000

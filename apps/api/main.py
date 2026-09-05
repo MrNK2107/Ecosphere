@@ -1274,20 +1274,20 @@ async def agora_agent_join(
     body: dict[str, Any] = Body(...),
     session: AsyncSession = Depends(get_db),
 ):
-    """Start the Conversational AI agent on this incident's RTC channel.
-    Body: {channel, agentRtcUid, rtcToken}. Token minting stays in the worker (already has an
-    Agora RTC token builder) — this endpoint only orchestrates the CAI agent lifecycle."""
+    """Start the Conversational AI agent on this incident's RTC channel via the official
+    `agora-agents` SDK (agora_conversational_ai.py). Body: {channel, agentRtcUid, remoteUid}.
+    No token in the request — the SDK mints the ConvoAI token internally in App Credentials mode."""
     inc_m = await session.get(IncidentModel, incident_id)
     if not inc_m:
         raise HTTPException(status_code=404, detail="incident not found")
     channel = body.get("channel") or incident_id
     agent_rtc_uid = body.get("agentRtcUid") or "echosphere-bot"
-    rtc_token = body.get("rtcToken", "")
+    remote_uid = body.get("remoteUid")
     system_prompt = (
         f"You are EchoSphere, an AI Incident Commander in the voice room for incident "
         f"'{inc_m.title}' (severity {inc_m.severity}). {cognition.VOICE_REPLY_SYSTEM_PROMPT}"
     )
-    result = await agora_conversational_ai.join_agent(incident_id, channel, agent_rtc_uid, rtc_token, system_prompt)
+    result = await agora_conversational_ai.join_agent(incident_id, channel, agent_rtc_uid, remote_uid, system_prompt)
     agent_id = result.get("agent_id", "")
     if agent_id:
         _agora_agents[incident_id] = agent_id
@@ -1309,24 +1309,54 @@ async def agora_agent_leave(incident_id: str, session: AsyncSession = Depends(ge
 
 
 @app.post("/agora/llm/chat/completions", tags=["agora"])
-async def agora_custom_llm(body: dict[str, Any] = Body(...)):
+async def agora_custom_llm(body: dict[str, Any] = Body(...), session: AsyncSession = Depends(get_db)):
     """Custom-LLM webhook for Agora Conversational AI Engine (AGORA_CAI_LLM_MODE=custom).
-    Agora calls this with an OpenAI-chat-completions-shaped request and requires an SSE stream
-    of chat.completion.chunk objects back. This is the AI's spoken voice in the room — separate
-    from the Fact/Hypothesis/Decision/Action extraction pipeline, which is fed via the room's
-    transcript arriving at POST /incidents/{id}/transcript (see agora_conversational_ai.py)."""
+
+    Matches the official Python/FastAPI reference (server-custom-llm/python/custom_llm.py):
+    Agora's engine sends `context: {appId, userId, channel}` on every call — `channel` is how we
+    know which incident this belongs to (our join endpoint always sets channel=incidentId, see
+    agora_agent_join). Without reading `context`, this endpoint had no way to tell which incident
+    a live voice request was for. Streams real token deltas (not a full-response-then-fake-chunk),
+    and grounds the reply in the incident's actual current facts/gaps so it can't invent things
+    the room hasn't actually established — directly serves the "never assert unconfirmed facts"
+    guardrail that was declared in the system prompt but previously had no state to draw on."""
     messages = body.get("messages", [])
-    reply_text = await cognition.generate_voice_reply(messages)
+    context = body.get("context") or {}
+    incident_id = context.get("channel")
+
+    grounding = ""
+    if incident_id:
+        inc_m = await session.get(IncidentModel, incident_id)
+        if inc_m:
+            snap = await _build_snapshot(session, incident_id)
+            fact_lines = "; ".join(f["statement"] for f in snap["facts"][-5:])
+            open_gaps = [g["message"] for g in snap["gaps"] if not g.get("resolvedAt")][:3]
+            grounding = f"\n\nCurrent incident state — Facts so far: {fact_lines or 'none yet'}."
+            if open_gaps:
+                grounding += f" Open issues: {'; '.join(open_gaps)}."
+
+    if grounding and messages:
+        messages = [{"role": "system", "content": grounding}] + list(messages)
+
     response_id = _gen_id("chatcmpl")
+    model_name = body.get("model") or "echosphere-cognition"
 
     async def _sse():
-        chunk = {
-            "id": response_id, "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}],
+        # Role-only first chunk, matching the official quickstart's chat/completions/route.ts —
+        # some OpenAI-protocol clients expect the role announced before any content.
+        first = {
+            "id": response_id, "object": "chat.completion.chunk", "model": model_name,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
         }
-        yield f"data: {json.dumps(chunk)}\n\n"
+        yield f"data: {json.dumps(first)}\n\n"
+        async for delta in cognition.generate_voice_reply_stream(messages):
+            chunk = {
+                "id": response_id, "object": "chat.completion.chunk", "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
         final_chunk = {
-            "id": response_id, "object": "chat.completion.chunk",
+            "id": response_id, "object": "chat.completion.chunk", "model": model_name,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
         yield f"data: {json.dumps(final_chunk)}\n\n"

@@ -2,132 +2,163 @@
 Agora Conversational AI Engine integration — MANDATORY per hackathon rules
 (docs.agora.io/en/ai/get-started/quickstart).
 
-Architecture (confirmed against Agora's REST API docs — see
-ECHOSPHERE_IMPLEMENTATION_PLAN.md Phase 1 for sources):
+Built against the OFFICIAL Agora references, cloned and inspected directly (not built from
+memory — see MENTOR_FEEDBACK.md for why that distinction matters):
+  - github.com/AgoraIO-Conversational-AI/agent-quickstart-nextjs (app/api/invite-agent/route.ts)
+  - github.com/AgoraIO-Conversational-AI/server-custom-llm (python/custom_llm.py — the official
+    Python/FastAPI custom-LLM reference; our stack matches exactly)
+  - The `agora` skill (docs.agora.io/en/introduction/agora-skills), installed via
+    `claude plugin install agora@agora-skills`, references/conversational-ai/*.md
+  - The `agora-agents` PyPI package's actual installed API (inspected via `inspect`, not
+    assumed — this file uses the real SDK, not hand-rolled REST + Basic Auth)
+
+Architecture (unchanged from the earlier version, now built the right way):
   - Agora CAI is a managed agent that joins the RTC channel as a bot and runs
-    ASR -> LLM -> TTS turn-by-turn, using either Agora-managed vendors
-    (credential_mode="managed"; the hackathon organizers offer Deepgram/OpenAI/
-    MiniMax with no extra keys) or a custom endpoint we control per slot.
-  - We default ASR + TTS to "managed" (zero extra keys, satisfies the mandate
-    with no setup) and LLM to "custom", pointed at our own
-    POST /agora/llm/chat/completions webhook — this keeps EchoSphere's own
-    cognition engine (Claude) as the in-room conversational brain instead of a
-    generic Agora-managed chatbot persona.
-  - Transcript delivery is SEPARATE from the LLM webhook: Agora CAI publishes
-    speaker-labeled ASR results as Signaling (RTM) channel messages. The
-    worker subscribes to that channel and forwards segments to
-    POST /incidents/{id}/transcript — our existing cognition/state pipeline
-    is unchanged. The custom-LLM webhook only produces the AI's spoken replies.
+    ASR -> LLM -> TTS turn-by-turn. ASR + TTS default to Agora-managed vendors
+    (Deepgram/MiniMax — the hackathon organizers' no-extra-keys option). LLM
+    defaults to "custom", pointed at our own POST /agora/llm/chat/completions
+    webhook, so EchoSphere's own cognition engine (Claude) stays the in-room
+    conversational brain instead of a generic Agora-managed persona.
+  - Transcript delivery is separate from the LLM webhook: with
+    advanced_features.enable_rtm + parameters.data_channel="rtm", the agent
+    publishes transcript/state events to the RTM channel matching the RTC
+    channel name — a worker subscribing to that channel is Phase 1's
+    remaining piece (see ECHOSPHERE_IMPLEMENTATION_PLAN.md).
+  - Auth: App Credentials mode (AGORA_APP_ID + AGORA_APP_CERT) is Agora's
+    *recommended* auth — the SDK mints a ConvoAI token per request
+    internally. The skill's own docs say Basic Auth (Customer ID/Secret) is
+    "for testing only" — the previous version of this file used Basic Auth
+    exclusively, which was a real deviation from the recommended pattern.
 
-Auth: HTTP Basic with base64(AGORA_CUSTOMER_ID:AGORA_CUSTOMER_SECRET) — same
-scheme as Agora's other RESTful API products (Real-Time STT, Signaling).
-
-NOT independently live-tested in this session — no Agora account/credentials
-were available. Request/response shapes are built exactly per Agora's
-documented REST API (join/leave under
-https://api.agora.io/api/conversational-ai-agent/v2/...); verify against a
-real account before relying on this in production.
+NOT independently live-tested in this session — no Agora account/credentials were available.
+Every shape here is copied from an official source, not invented; still needs verification
+against a real account before relying on it in production.
 """
 from __future__ import annotations
 
-import base64
 import logging
 import os
+import uuid
 from typing import Any, Optional
-
-import httpx
 
 logger = logging.getLogger("agora.conversational_ai")
 
 AGORA_APP_ID = os.getenv("AGORA_APP_ID", "")
-AGORA_CUSTOMER_ID = os.getenv("AGORA_CUSTOMER_ID", "")
-AGORA_CUSTOMER_SECRET = os.getenv("AGORA_CUSTOMER_SECRET", "")
-AGORA_CAI_ASR_MODE = os.getenv("AGORA_CAI_ASR_MODE", "managed")
-AGORA_CAI_TTS_MODE = os.getenv("AGORA_CAI_TTS_MODE", "managed")
+AGORA_APP_CERT = os.getenv("AGORA_APP_CERT", "") or os.getenv("AGORA_CERT", "")
+AGORA_AREA = os.getenv("AGORA_AREA", "US")  # US | EU | AP | CN — see agent-quickstart-nextjs
 AGORA_CAI_LLM_MODE = os.getenv("AGORA_CAI_LLM_MODE", "custom")
+# Base URL only (no /chat/completions suffix) — matches OpenAI(base_url=...) semantics, e.g.
+# https://your-tunnel.ngrok.io/agora — the SDK/Agora will POST base_url + "/chat/completions".
 AGORA_CUSTOM_LLM_URL = os.getenv("AGORA_CUSTOM_LLM_URL", "")
+AGORA_CUSTOM_LLM_SHARED_SECRET = os.getenv("AGORA_CUSTOM_LLM_SHARED_SECRET", "echosphere-internal")
 
-CAI_ENABLED = bool(AGORA_APP_ID and AGORA_CUSTOMER_ID and AGORA_CUSTOMER_SECRET)
+CAI_ENABLED = bool(AGORA_APP_ID and AGORA_APP_CERT)
 
-_BASE_URL = "https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}"
-
-
-def _auth_header() -> dict[str, str]:
-    token = base64.b64encode(f"{AGORA_CUSTOMER_ID}:{AGORA_CUSTOMER_SECRET}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
-
-
-def build_join_payload(
-    incident_id: str,
-    channel: str,
-    agent_rtc_uid: str,
-    rtc_token: str,
-    system_prompt: str,
-    greeting: str = "EchoSphere here — I'm listening and tracking this incident.",
-) -> dict[str, Any]:
-    """Build the exact join request body per Agora's documented schema."""
-    llm_section: dict[str, Any] = {
-        "system_messages": [{"role": "system", "content": system_prompt}],
-        "greeting_message": greeting,
-        "failure_message": "Sorry, I couldn't process that just now.",
-        "max_history": 20,
+# Turn-detection / interruption config copied from the official Next.js quickstart's
+# invite-agent route — this is what makes "user interruption handling" (a mandatory,
+# universal hackathon requirement) actually work; the earlier version of this file omitted
+# turn-detection entirely and relied on undocumented defaults.
+_TURN_DETECTION = {
+    "config": {
+        "speech_threshold": 0.5,
+        "start_of_speech": {
+            "mode": "vad",
+            "vad_config": {"interrupt_duration_ms": 160, "prefix_padding_ms": 300},
+        },
+        "end_of_speech": {
+            "mode": "vad",
+            "vad_config": {"silence_duration_ms": 480},
+        },
     }
+}
+_ADVANCED_FEATURES = {"enable_rtm": True, "enable_tools": True}
+_SESSION_PARAMETERS = {
+    "audio_scenario": "chorus",
+    "data_channel": "rtm",
+    "enable_error_message": True,
+    "enable_metrics": True,
+}
+
+_client = None  # lazy singleton — module-level so join/leave share one AsyncAgora client
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        from agora_agent import AsyncAgora, Area
+        area = getattr(Area, AGORA_AREA, Area.US)
+        _client = AsyncAgora(area=area, app_id=AGORA_APP_ID, app_certificate=AGORA_APP_CERT)
+    return _client
+
+
+def _build_agent(system_prompt: str, greeting: str):
+    from agora_agent import Agent
+    from agora_agent.agentkit import OpenAI, DeepgramSTT, MiniMaxTTS
+
+    failure_message = "Sorry, I couldn't process that just now."
+    agent = Agent(
+        client=_get_client(),
+        instructions=system_prompt,
+        greeting=greeting,
+        failure_message=failure_message,
+        max_history=50,
+        turn_detection=_TURN_DETECTION,
+        advanced_features=_ADVANCED_FEATURES,
+        parameters=_SESSION_PARAMETERS,
+    )
+
     if AGORA_CAI_LLM_MODE == "custom":
         if not AGORA_CUSTOM_LLM_URL:
             raise RuntimeError("AGORA_CUSTOM_LLM_URL must be set when AGORA_CAI_LLM_MODE=custom")
-        llm_section.update({
-            "credential_mode": "custom",
-            "vendor": "custom",
-            "style": "openai",
-            "url": AGORA_CUSTOM_LLM_URL,
-            "params": {"model": "echosphere-cognition"},
-        })
+        agent = agent.with_llm(OpenAI(
+            base_url=AGORA_CUSTOM_LLM_URL,
+            api_key=AGORA_CUSTOM_LLM_SHARED_SECRET,
+            model="echosphere-cognition",
+            greeting_message=greeting,
+            failure_message=failure_message,
+            max_history=15,
+        ))
     else:
-        llm_section.update({
-            "credential_mode": "managed",
-            "vendor": "openai",
-            "style": "openai",
-            "params": {"model": "gpt-4o-mini"},
-        })
+        agent = agent.with_llm(OpenAI(
+            model="gpt-4o-mini", greeting_message=greeting, failure_message=failure_message, max_history=15,
+        ))
 
-    asr_section: dict[str, Any] = {"credential_mode": AGORA_CAI_ASR_MODE, "vendor": "deepgram", "params": {"language": "en-US"}}
-    tts_section: dict[str, Any] = {"credential_mode": AGORA_CAI_TTS_MODE, "vendor": "minimax", "params": {"voice_setting": {"voice_id": "female_1"}}}
-
-    return {
-        "name": f"echosphere-{incident_id}",
-        "properties": {
-            "channel": channel,
-            "token": rtc_token,
-            "agent_rtc_uid": agent_rtc_uid,
-            "enable_string_uid": True,
-            "idle_timeout": 600,
-            "asr": asr_section,
-            "llm": llm_section,
-            "tts": tts_section,
-        },
-    }
+    # Omitting api_key on STT/TTS uses Agora-managed reseller billing (the organizers' no-extra-
+    # keys option) — matches the official quickstart's default (non-BYOK) branch exactly.
+    agent = agent.with_stt(DeepgramSTT(model="nova-3", language="en"))
+    agent = agent.with_tts(MiniMaxTTS(model="speech_2_6_turbo", voice_id="English_captivating_female1"))
+    return agent
 
 
 async def join_agent(
-    incident_id: str, channel: str, agent_rtc_uid: str, rtc_token: str, system_prompt: str,
+    incident_id: str, channel: str, agent_rtc_uid: str, remote_uid: Optional[str], system_prompt: str,
+    greeting: str = "EchoSphere here — I'm listening and tracking this incident.",
 ) -> dict[str, Any]:
-    """POST .../join — start the Conversational AI agent on an incident's RTC channel."""
+    """Start the Conversational AI agent on an incident's RTC channel via the official SDK."""
     if not CAI_ENABLED:
         return {"mode": "mock", "agent_id": f"mock-agent-{incident_id}", "status": "RUNNING"}
-    payload = build_join_payload(incident_id, channel, agent_rtc_uid, rtc_token, system_prompt)
-    url = _BASE_URL.format(app_id=AGORA_APP_ID) + "/join"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, json=payload, headers=_auth_header())
-        r.raise_for_status()
-        return r.json()
+
+    agent = _build_agent(system_prompt, greeting)
+    # Agent name must be unique per project (collision -> HTTP 409 per the agora skill's
+    # documented gotcha) — short UUID suffix, same pattern the skill recommends.
+    session_name = f"echosphere-{incident_id}-{uuid.uuid4().hex[:8]}"
+    session = agent.create_async_session(
+        channel=channel,
+        agent_uid=str(agent_rtc_uid),  # must be a string, not int — documented SDK gotcha
+        remote_uids=[str(remote_uid)] if remote_uid else ["*"],
+        name=session_name,
+        idle_timeout=600,
+        enable_string_uid=True,
+    )
+    agent_id = await session.start()
+    return {"agent_id": agent_id, "status": "RUNNING", "session_name": session_name}
 
 
 async def leave_agent(agent_id: str) -> dict[str, Any]:
-    """POST .../agents/{agentId}/leave — stop a running Conversational AI agent."""
+    """Stop a running Conversational AI agent — stateless (doesn't need the original session
+    object), matching the SDK's documented stateless-handler pattern."""
     if not CAI_ENABLED or agent_id.startswith("mock-agent-"):
         return {"mode": "mock", "status": "STOPPED"}
-    url = _BASE_URL.format(app_id=AGORA_APP_ID) + f"/agents/{agent_id}/leave"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, headers=_auth_header())
-        r.raise_for_status()
-        return r.json() if r.content else {}
+    client = _get_client()
+    await client.stop_agent(agent_id)
+    return {"status": "STOPPED"}

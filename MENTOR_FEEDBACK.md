@@ -54,13 +54,37 @@ Needs a precise, confident, specific answer — not vague. Current precise answe
   (Agora's own official sample apps, and comparable production "AI incident commander" /
   voice-agent products) instead of improvising the architecture from scratch.
 
-## What's changing as a result
+## What changed as a result
 
-1. Researching Agora's own official sample/reference implementation for a custom-LLM
-   Conversational AI agent, and comparable production incident-commander products, to align the
-   rebuild with proven patterns rather than ad-hoc decisions (in progress).
-2. Agora account is being obtained by the user — once available, the live voice path gets tested
-   for real, which resolves questions 1–3 by replacing "fabricated/never tested" with an actual
-   working demonstration.
-3. Any further changes to the ingestion/voice pipeline will be checked against the reference
-   pattern found in (1) before being written, not designed fresh each time.
+1. **Installed Agora's own official Claude Code skill** (`claude plugin install agora@agora-skills`
+   — this is a real, official product: docs.agora.io/en/introduction/agora-skills). Its own
+   enforcement rules state almost exactly the mentor's criticism: *"if the agent has generated a
+   `/join` payload from memory... without first inspecting the quickstart source... stop the
+   custom path."* That's precisely what had happened.
+2. **Cloned and directly inspected the official source** (not just read about it):
+   `agent-quickstart-nextjs` (the reference client+server), and
+   `server-custom-llm/python` (the official Python/FastAPI custom-LLM reference — our exact
+   stack).
+3. **Rewrote `apps/api/agora_conversational_ai.py`** to use the real `agora-agents` PyPI package
+   (the official Python SDK) instead of hand-rolled REST calls with Basic Auth. Concrete
+   corrections made from the real source, not guessed:
+   - Auth: App Credentials mode (App ID + Certificate) — Agora's own docs call Basic Auth
+     (Customer ID/Secret), which the old version used exclusively, *"for testing only."*
+   - Turn-detection/VAD config was completely missing before — this is what actually makes
+     "user interruption handling" (a mandatory site-wide requirement) work, copied from the
+     official quickstart's exact values.
+   - `agent_rtc_uid` must be a string (was previously a documented risk, not yet verified).
+   - Agent names now get a UUID suffix (Agora returns HTTP 409 on name collision).
+4. **Rewrote the custom-LLM webhook** (`POST /agora/llm/chat/completions`) to match the official
+   Python reference's actual pattern:
+   - Reads `context.channel` from Agora's request to know which incident a live voice call
+     belongs to — **the old version had no way to do this at all**, a real correctness gap.
+   - Grounds the spoken reply in the incident's actual current facts/gaps (queried from the DB),
+     instead of answering with zero awareness of incident state.
+   - Streams real token deltas from Claude as they're generated, instead of buffering the whole
+     reply and faking a two-chunk stream.
+5. All of this is now backed by 83 passing tests (10 new/rewritten for the Agora integration
+   specifically) exercising the real SDK's config construction and the webhook's context-routing.
+6. **Still unresolved**: none of this has been run against a real Agora account — that remains
+   entirely blocked on the user obtaining Agora credentials (`SETUP.md` §1). Code correctness is
+   now verified against official sources; live behavior is not yet verified at all.

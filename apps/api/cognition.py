@@ -198,27 +198,34 @@ VOICE_REPLY_SYSTEM_PROMPT = (
 )
 
 
-async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[str] = None) -> str:
-    """
-    Plain-text conversational reply for the Agora Conversational AI custom-LLM webhook
-    (apps/api/agora_conversational_ai.py). Distinct from extract_llm/generate_summary: this is
-    the AI's spoken voice in the room, not the structured Fact/Hypothesis/Decision extraction
-    pipeline (which is fed separately via POST /incidents/{id}/transcript).
-    """
-    if not LLM_ENABLED:
-        return "I'm here, but no language model is configured yet — set LLM_PROVIDER and a key, or LLM_PROVIDER=ollama for a local model."
-    # messages arrive in OpenAI chat format ({role, content}); fold any embedded "system" turns
-    # into user context since Claude's Messages API only allows {user, assistant} roles.
-    claude_messages = []
+def _normalize_voice_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """OpenAI-chat-format messages -> Claude Messages API format ({user, assistant} roles only —
+    fold any embedded "system" turns into user context)."""
+    normalized = []
     for m in messages:
         role = "assistant" if m.get("role") == "assistant" else "user"
         content = m.get("content", "")
         if isinstance(content, list):
             content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
         if content:
-            claude_messages.append({"role": role, "content": str(content)})
-    if not claude_messages:
-        claude_messages = [{"role": "user", "content": "(no transcript yet)"}]
+            normalized.append({"role": role, "content": str(content)})
+    return normalized or [{"role": "user", "content": "(no transcript yet)"}]
+
+
+async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[str] = None) -> str:
+    """
+    Plain-text conversational reply for the Agora Conversational AI custom-LLM webhook
+    (apps/api/agora_conversational_ai.py). Distinct from extract_llm/generate_summary: this is
+    the AI's spoken voice in the room, not the structured Fact/Hypothesis/Decision extraction
+    pipeline (which is fed separately via POST /incidents/{id}/transcript).
+    Non-streaming — prefer generate_voice_reply_stream for the actual webhook (real Agora traffic
+    requires streaming; see the "chat completions require streaming" contract in
+    docs.agora.io/en/conversational-ai/develop/custom-llm). This is kept for callers that just
+    want the final text (e.g. tests, or a non-Agora caller).
+    """
+    if not LLM_ENABLED:
+        return "I'm here, but no language model is configured yet — set LLM_PROVIDER and a key, or LLM_PROVIDER=ollama for a local model."
+    claude_messages = _normalize_voice_messages(messages)
     try:
         if LLM_PROVIDER == "claude" and _anthropic_client is not None:
             response = await _anthropic_client.messages.create(
@@ -237,6 +244,34 @@ async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[s
     except Exception as e:
         logger.warning(f"generate_voice_reply failed: {e}")
         return "Sorry, I couldn't process that just now."
+
+
+async def generate_voice_reply_stream(messages: list[dict[str, Any]], model: Optional[str] = None):
+    """
+    Async generator yielding text deltas as they're generated — real token-by-token streaming,
+    not the full-response-then-fake-chunk pattern. Matches the official Agora custom-LLM
+    reference (server-custom-llm/python/custom_llm.py), which streams real provider chunks
+    rather than buffering the whole reply first — this matters for perceived latency in a live
+    voice call. Falls back to yielding the whole reply as one chunk for non-Claude providers
+    (OpenAI/Ollama streaming wasn't implemented for this secondary path — Claude is primary).
+    """
+    if not LLM_ENABLED:
+        yield "I'm here, but no language model is configured yet."
+        return
+    claude_messages = _normalize_voice_messages(messages)
+    try:
+        if LLM_PROVIDER == "claude" and _anthropic_client is not None:
+            async with _anthropic_client.messages.stream(
+                model=model or ANTHROPIC_MODEL_EXTRACT, max_tokens=300,
+                system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield text
+        else:
+            yield await generate_voice_reply(messages, model)
+    except Exception as e:
+        logger.warning(f"generate_voice_reply_stream failed: {e}")
+        yield "Sorry, I couldn't process that just now."
 
 
 async def _call_openai(system: str, user: str, model: str = "", temperature: float = 0) -> str:
