@@ -1272,6 +1272,7 @@ async def tools_status():
         "deepgram": _s("DEEPGRAM_API_KEY"), "agora": _s("AGORA_APP_ID"),
         "agora_conversational_ai": "live" if agora_conversational_ai.CAI_ENABLED else "mock",
         "tts": tts.TTS_PROVIDER if tts.get_tts_provider().name() != "mock" else "mock",
+        "llm_provider": cognition.LLM_PROVIDER, "voice_llm_provider": cognition.VOICE_LLM_PROVIDER,
     }
 
 

@@ -103,6 +103,21 @@ else:
 
 LLM_ENABLED = bool(ANTHROPIC_API_KEY or OPENAI_API_KEY or LLM_PROVIDER == "ollama")
 
+# VOICE_LLM_PROVIDER — separate override for generate_voice_reply[_stream] only (the live-voice
+# webhook), independent of LLM_PROVIDER (extraction + summary). Added 2026-09-06: LLM_PROVIDER
+# was being set to "ollama" for local/free extraction+summary, which silently also routed voice
+# replies through Ollama — measured at ~33s/reply, unusable for real-time voice (see CONFLICT.md).
+# Falls back to LLM_PROVIDER when unset, so existing single-provider setups are unaffected.
+_VOICE_PROVIDER_OVERRIDE = os.getenv("VOICE_LLM_PROVIDER", "").strip().lower()
+if _VOICE_PROVIDER_OVERRIDE in ("claude", "anthropic"):
+    VOICE_LLM_PROVIDER = "claude"
+elif _VOICE_PROVIDER_OVERRIDE == "openai":
+    VOICE_LLM_PROVIDER = "openai"
+elif _VOICE_PROVIDER_OVERRIDE in ("ollama", "local"):
+    VOICE_LLM_PROVIDER = "ollama"
+else:
+    VOICE_LLM_PROVIDER = LLM_PROVIDER
+
 try:
     import anthropic  # type: ignore
     _anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -227,14 +242,14 @@ async def generate_voice_reply(messages: list[dict[str, Any]], model: Optional[s
         return "I'm here, but no language model is configured yet — set LLM_PROVIDER and a key, or LLM_PROVIDER=ollama for a local model."
     claude_messages = _normalize_voice_messages(messages)
     try:
-        if LLM_PROVIDER == "claude" and _anthropic_client is not None:
+        if VOICE_LLM_PROVIDER == "claude" and _anthropic_client is not None:
             response = await _anthropic_client.messages.create(
                 model=model or ANTHROPIC_MODEL_EXTRACT, max_tokens=300,
                 system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
             )
             text_block = next((b for b in response.content if b.type == "text"), None)
             return text_block.text if text_block else ""
-        elif LLM_PROVIDER == "ollama":
+        elif VOICE_LLM_PROVIDER == "ollama":
             history_text = "\n".join(f"{m['role']}: {m['content']}" for m in claude_messages)
             return await _call_ollama(VOICE_REPLY_SYSTEM_PROMPT, history_text, model=model or OLLAMA_MODEL_EXTRACT, json_mode=False)
         else:
@@ -260,7 +275,7 @@ async def generate_voice_reply_stream(messages: list[dict[str, Any]], model: Opt
         return
     claude_messages = _normalize_voice_messages(messages)
     try:
-        if LLM_PROVIDER == "claude" and _anthropic_client is not None:
+        if VOICE_LLM_PROVIDER == "claude" and _anthropic_client is not None:
             async with _anthropic_client.messages.stream(
                 model=model or ANTHROPIC_MODEL_EXTRACT, max_tokens=300,
                 system=VOICE_REPLY_SYSTEM_PROMPT, messages=claude_messages,
