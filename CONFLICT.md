@@ -82,15 +82,20 @@ Also clarified while testing: ASR (Deepgram) and TTS (MiniMax) in the current im
 Agora-managed/billed (see `agora_conversational_ai.py`'s `_build_agent`, no `api_key` passed) — no
 separate Deepgram or TTS key is needed for the voice path itself, softening one of the asks below.
 
+**Update 2026-09-06 (later same day): Customer ID + Secret also received and wired in**
+(`agora_conversational_ai.py`'s `_get_client()` now passes `customer_id`/`customer_secret` to
+`AsyncAgora` alongside `app_id`/`app_certificate`). Re-ran the same `agents.list()` call — it now
+**succeeds** (empty list, no agents running yet), fully resolving the auth-type gap noted above.
+Both Agora credential pairs are now confirmed live and correctly wired.
+
 Still needed to move forward, in priority order:
-- **Agora Customer ID + Customer Secret** (Agora Console → RESTful API keys) — to resolve the
-  auth-type gap found above and enable the management API fully
 - **A publicly reachable URL** for the custom-LLM webhook (`AGORA_CUSTOM_LLM_URL`), since Agora's
   servers need to reach it (ngrok, or a real deployment) — `join_agent()` raises immediately
   without this; local `localhost:8000` won't work for this specific piece
 - **A way to actually join a live RTC channel** (a browser client, e.g. the official
   agent-quickstart-nextjs page, or Agora's web demo) to prove `join_agent()` end-to-end — code
-  correctness alone isn't proof here
+  correctness and account-level auth are now both confirmed, but nobody has actually joined a
+  channel and heard the agent respond yet
 - **Real Jira/Slack/PagerDuty/Datadog** access, if you want those integrations genuinely live
   rather than honestly-labeled "mocked, credentials not provided" in the known-limitations doc
 
