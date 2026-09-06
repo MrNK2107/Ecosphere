@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>EchoSphere — Live Voice Test</title>
+<script src="https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.20.0/AgoraRTC_N-production.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 20px; }
+  label { display: block; margin-top: 12px; font-size: 13px; color: #444; }
+  input { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box; }
+  button { margin-top: 16px; padding: 10px 18px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+  #log { margin-top: 20px; padding: 12px; background: #f4f4f4; border-radius: 6px; font-family: monospace;
+         font-size: 12px; white-space: pre-wrap; height: 300px; overflow-y: auto; }
+  .status { font-weight: bold; }
+  .ok { color: #0a7a2f; }
+  .err { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>EchoSphere — Live Voice Test</h1>
+<p>Joins an Agora RTC channel with your microphone, then asks EchoSphere's Conversational AI agent to join the same channel. Talk into your mic once both say "joined".</p>
+
+<label>API base URL</label>
+<input id="apiUrl" value="http://localhost:8000" />
+
+<label>Incident ID</label>
+<input id="incidentId" value="payment-001" />
+
+<label>Channel name (must match for you and the agent)</label>
+<input id="channel" value="voice-test-1" />
+
+<button id="joinBtn">1. Join as human (mic)</button>
+<button id="agentBtn">2. Start EchoSphere agent</button>
+<button id="leaveBtn">Leave / stop agent</button>
+
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById("log");
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let client = null;
+let localAudioTrack = null;
+
+document.getElementById("joinBtn").onclick = async () => {
+  const apiUrl = document.getElementById("apiUrl").value.replace(/\/$/, "");
+  const channel = document.getElementById("channel").value;
+  const uid = Math.floor(Math.random() * 100000) + 1;
+  try {
+    log(`Requesting RTC token for channel "${channel}" uid ${uid}...`);
+    const res = await fetch(`${apiUrl}/agora/rtc-token?channel=${encodeURIComponent(channel)}&uid=${uid}&role=publisher`);
+    if (!res.ok) throw new Error(`Token request failed: ${res.status} ${await res.text()}`);
+    const { token, appId } = await res.json();
+    log(`Got token, appId=${appId}. Joining channel...`, "ok");
+
+    client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    client.on("user-published", async (user, mediaType) => {
+      log(`Remote user ${user.uid} published ${mediaType}`);
+      await client.subscribe(user, mediaType);
+      if (mediaType === "audio") {
+        user.audioTrack.play();
+        log(`Playing audio from remote user ${user.uid} (this should be EchoSphere speaking)`, "ok");
+      }
+    });
+    client.on("user-left", (user) => log(`Remote user ${user.uid} left`));
+
+    await client.join(appId, channel, token, uid);
+    log(`Joined channel "${channel}" as uid ${uid}`, "ok");
+
+    localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+    await client.publish([localAudioTrack]);
+    log("Microphone published. You can talk now.", "ok");
+  } catch (e) {
+    log(`ERROR: ${e.message || e}`, "err");
+    console.error(e);
+  }
+};
+
+document.getElementById("agentBtn").onclick = async () => {
+  const apiUrl = document.getElementById("apiUrl").value.replace(/\/$/, "");
+  const incidentId = document.getElementById("incidentId").value;
+  const channel = document.getElementById("channel").value;
+  try {
+    log(`Asking API to start EchoSphere agent on channel "${channel}"...`);
+    const res = await fetch(`${apiUrl}/incidents/${encodeURIComponent(incidentId)}/agora-agent/join`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, agentRtcUid: "911911" }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(`Agent join failed: ${res.status} ${JSON.stringify(body)}`);
+    log(`Agent join response: ${JSON.stringify(body)}`, body.status === "RUNNING" || body.agent_id ? "ok" : "err");
+  } catch (e) {
+    log(`ERROR: ${e.message || e}`, "err");
+    console.error(e);
+  }
+};
+
+document.getElementById("leaveBtn").onclick = async () => {
+  const apiUrl = document.getElementById("apiUrl").value.replace(/\/$/, "");
+  const incidentId = document.getElementById("incidentId").value;
+  try {
+    if (client) {
+      if (localAudioTrack) { localAudioTrack.stop(); localAudioTrack.close(); }
+      await client.leave();
+      log("Left RTC channel.");
+    }
+    const res = await fetch(`${apiUrl}/incidents/${encodeURIComponent(incidentId)}/agora-agent/leave`, { method: "POST" });
+    log(`Agent leave response: ${res.status} ${await res.text()}`);
+  } catch (e) {
+    log(`ERROR: ${e.message || e}`, "err");
+    console.error(e);
+  }
+};
+</script>
+</body>
+</html>

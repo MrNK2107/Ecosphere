@@ -1294,6 +1294,23 @@ async def get_spoken_summary_audio(incident_id: str, filename: str):
 _agora_agents: dict[str, str] = {}  # incidentId -> agent_id, in-process (single-worker) tracking
 
 
+@app.get("/agora/rtc-token", tags=["agora"])
+async def agora_rtc_token(channel: str, uid: int = 0, role: str = "publisher", expire: int = 3600):
+    """RTC token for a human/browser client to join the same voice channel as the
+    Conversational AI agent — for manual live-voice testing, not used by the agent itself
+    (it mints its own token internally)."""
+    if not agora_conversational_ai.CAI_ENABLED:
+        raise HTTPException(status_code=503, detail="Agora not configured (AGORA_APP_ID/AGORA_APP_CERT missing)")
+    from agora_agent import generate_rtc_token
+    rtc_role = 1 if role.lower() == "publisher" else 2
+    token = generate_rtc_token(
+        app_id=agora_conversational_ai.AGORA_APP_ID,
+        app_certificate=agora_conversational_ai.AGORA_APP_CERT,
+        channel=channel, uid=uid, role=rtc_role, expiry_seconds=expire,
+    )
+    return {"token": token, "appId": agora_conversational_ai.AGORA_APP_ID, "channel": channel, "uid": uid}
+
+
 @app.post("/incidents/{incident_id}/agora-agent/join", tags=["agora"])
 async def agora_agent_join(
     incident_id: str,
@@ -1307,7 +1324,13 @@ async def agora_agent_join(
     if not inc_m:
         raise HTTPException(status_code=404, detail="incident not found")
     channel = body.get("channel") or incident_id
-    agent_rtc_uid = body.get("agentRtcUid") or "echosphere-bot"
+    # Must be all-digits: the agent-kit SDK auto-generates the ConvoAI token in App Credentials
+    # mode and rejects a non-numeric agent_uid (confirmed live 2026-09-06 — "echosphere-bot"
+    # raised ValueError deep in agent.to_properties()). enable_string_uid on the session only
+    # covers remote_uids, not the agent's own uid.
+    agent_rtc_uid = body.get("agentRtcUid") or "911911"
+    if not str(agent_rtc_uid).isdigit():
+        raise HTTPException(status_code=422, detail="agentRtcUid must be a numeric RTC UID")
     remote_uid = body.get("remoteUid")
     system_prompt = (
         f"You are EchoSphere, an AI Incident Commander in the voice room for incident "
