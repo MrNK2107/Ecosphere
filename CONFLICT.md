@@ -65,15 +65,32 @@ speech instead of the scripted fixture, which depends on #1).**
 
 ## 4. What I need from you to fix section 1 and 3
 
-I cannot make the voice path real without real credentials — this isn't something more code
-solves. To move forward I need to know, for each of these, whether you have it or need to get it:
+**Update 2026-09-06: App ID + App Certificate received and wired in** (`.env`, loaded by
+`scripts/run-api.ps1`, which previously didn't source `.env` at all — fixed). `/tools/status` now
+reports `agora: live` and `agora_conversational_ai: live`. Confirmed these are real, live-reachable
+credentials by calling Agora's actual `agents.list()` management endpoint directly (not a mock) —
+got a genuine HTTP 401 with a real Agora trace ID back, not a network failure. The 401 itself
+("Invalid authentication type") is informative: `AsyncAgora`'s constructor accepts an optional
+`customer_id`/`customer_secret` pair distinct from `app_id`/`app_certificate`, so this specific
+management-API call appears to require Customer ID/Secret Basic Auth even though the SDK's
+session-join flow (`agents.start()`, what `join_agent()` actually calls) is documented to use App
+Credentials mode. **Not yet confirmed whether `join_agent()` itself works** — that needs
+`AGORA_CUSTOM_LLM_URL` (still unset, see below) plus a real RTC client actually joining a channel,
+neither of which has been tested yet.
 
-- **Agora**: App ID + App Certificate (RTC), Customer ID + Customer Secret (REST APIs for
-  Conversational AI / Signaling) — from Agora Console
-- **A publicly reachable URL** for the custom-LLM webhook, since Agora's servers need to reach it
-  (ngrok, or a real deployment) — local `localhost:8000` won't work for this specific piece
-- **At least one of**: Deepgram key, OpenAI key (for TTS), or confirmation you want to run
-  entirely on Agora-managed ASR/TTS (no extra keys, per the organizers' guidance)
+Also clarified while testing: ASR (Deepgram) and TTS (MiniMax) in the current implementation are
+Agora-managed/billed (see `agora_conversational_ai.py`'s `_build_agent`, no `api_key` passed) — no
+separate Deepgram or TTS key is needed for the voice path itself, softening one of the asks below.
+
+Still needed to move forward, in priority order:
+- **Agora Customer ID + Customer Secret** (Agora Console → RESTful API keys) — to resolve the
+  auth-type gap found above and enable the management API fully
+- **A publicly reachable URL** for the custom-LLM webhook (`AGORA_CUSTOM_LLM_URL`), since Agora's
+  servers need to reach it (ngrok, or a real deployment) — `join_agent()` raises immediately
+  without this; local `localhost:8000` won't work for this specific piece
+- **A way to actually join a live RTC channel** (a browser client, e.g. the official
+  agent-quickstart-nextjs page, or Agora's web demo) to prove `join_agent()` end-to-end — code
+  correctness alone isn't proof here
 - **Real Jira/Slack/PagerDuty/Datadog** access, if you want those integrations genuinely live
   rather than honestly-labeled "mocked, credentials not provided" in the known-limitations doc
 
