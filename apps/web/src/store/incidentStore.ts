@@ -32,8 +32,14 @@ export type ActionItem = {
   requiresConfirmation: boolean; dueAt?: string | null; toolKey?: string;
 };
 export type Gap = {
-  id: string; kind: "MissingOwner" | "ConflictingInfo" | "UnverifiedAssumption" | "StaleAction";
+  id: string;
+  kind: "MissingOwner" | "ConflictingInfo" | "UnverifiedAssumption" | "StaleAction" | "AssumptionCreep" | "DuplicateWork" | "DecisionHygiene";
   severity: "low" | "medium" | "high" | "critical"; message: string; relatedIds: string[];
+};
+export type Conflict = {
+  id: string; incidentId: string; claimA: string; claimB: string;
+  status: "OPEN" | "UNDER_REVIEW" | "RESOLVED" | "DISMISSED";
+  resolution?: string; verificationRequired: boolean; relatedIds: string[]; detectedAt: string;
 };
 export type TimelineEvent = {
   id: string; incidentId: string; type: string; seq: number;
@@ -46,7 +52,7 @@ export type ToolEvent = {
 };
 export type Snapshot = {
   incident: Incident; facts: Fact[]; hypotheses: Hypothesis[];
-  decisions: Decision[]; actions: ActionItem[]; gaps: Gap[];
+  decisions: Decision[]; actions: ActionItem[]; gaps: Gap[]; conflicts: Conflict[];
   timeline: TimelineEvent[]; transcript: TranscriptSegment[];
   toolEvents: ToolEvent[];
 };

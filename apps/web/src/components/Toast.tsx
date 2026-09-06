@@ -36,9 +36,9 @@ export function ToastContainer() {
   };
 
   const colors: Record<ToastType, string> = {
-    success: "bg-green-900/80 border-green-700 text-green-200",
-    error: "bg-red-900/80 border-red-700 text-red-200",
-    info: "bg-blue-900/80 border-blue-700 text-blue-200",
+    success: "bg-emerald-50 border-emerald-200 text-emerald-800",
+    error: "bg-red-50 border-red-200 text-red-800",
+    info: "bg-blue-50 border-blue-200 text-blue-800",
   };
 
   if (toasts.length === 0) return null;
@@ -48,7 +48,7 @@ export function ToastContainer() {
       {toasts.map((t) => (
         <div
           key={t.id}
-          className={`px-3 py-2 rounded border text-xs max-w-xs ${colors[t.type]} flex items-start gap-2 cursor-pointer`}
+          className={`px-3 py-2 rounded-lg border text-xs max-w-xs shadow-sm ${colors[t.type]} flex items-start gap-2 cursor-pointer`}
           onClick={() => removeToast(t.id)}
         >
           <span className="flex-1">{t.message}</span>
