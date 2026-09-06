@@ -45,6 +45,13 @@ logger = logging.getLogger("agora.conversational_ai")
 
 AGORA_APP_ID = os.getenv("AGORA_APP_ID", "")
 AGORA_APP_CERT = os.getenv("AGORA_APP_CERT", "") or os.getenv("AGORA_CERT", "")
+# Optional — App Credentials mode (above) covers the session join/start flow, but some
+# account-level management endpoints (e.g. listing agents) reject it with a 401 "Invalid
+# authentication type" and require Customer ID/Secret Basic Auth instead. Passing both to
+# AsyncAgora lets the SDK use whichever each endpoint actually needs — confirmed live
+# 2026-09-06: agents.list() failed with only app_id/app_cert, succeeded once these were added.
+AGORA_CUSTOMER_ID = os.getenv("AGORA_CUSTOMER_ID", "")
+AGORA_CUSTOMER_SECRET = os.getenv("AGORA_CUSTOMER_SECRET", "")
 AGORA_AREA = os.getenv("AGORA_AREA", "US")  # US | EU | AP | CN — see agent-quickstart-nextjs
 AGORA_CAI_LLM_MODE = os.getenv("AGORA_CAI_LLM_MODE", "custom")
 # Base URL only (no /chat/completions suffix) — matches OpenAI(base_url=...) semantics, e.g.
@@ -87,7 +94,10 @@ def _get_client():
     if _client is None:
         from agora_agent import AsyncAgora, Area
         area = getattr(Area, AGORA_AREA, Area.US)
-        _client = AsyncAgora(area=area, app_id=AGORA_APP_ID, app_certificate=AGORA_APP_CERT)
+        _client = AsyncAgora(
+            area=area, app_id=AGORA_APP_ID, app_certificate=AGORA_APP_CERT,
+            customer_id=AGORA_CUSTOMER_ID or None, customer_secret=AGORA_CUSTOMER_SECRET or None,
+        )
     return _client
 
 
