@@ -14,6 +14,7 @@ const typeDot: Record<string, string> = {
   gap_resolved: "bg-emerald-500",
   tool: "bg-cyan-500",
   summary: "bg-indigo-500",
+  spoken_summary: "bg-indigo-400",
   system: "bg-slate-400",
 };
 
@@ -30,11 +31,46 @@ const typeIcon: Record<string, string> = {
   gap_resolved: "✓",
   tool: "🔧",
   summary: "📝",
+  spoken_summary: "🔊",
   system: "⚙️",
 };
 
+function formatEventText(event: TimelineEvent): string {
+  const p = event.payload ?? {};
+  const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : JSON.stringify(v));
+  switch (event.type) {
+    case "transcript":
+      return `${str(p.speakerName) || "Someone"}: ${str(p.text)}`;
+    case "fact_created":
+    case "fact_updated":
+    case "hypothesis_created":
+    case "hypothesis_updated":
+      return `${str(p.statement)}${p.status ? ` (${str(p.status)})` : ""}`;
+    case "decision":
+      return `${str(p.statement)}${p.status ? ` (${str(p.status)})` : ""}`;
+    case "action_created":
+      return str(p.title);
+    case "action_updated":
+      return `${str(p.title)}${p.status ? ` → ${str(p.status)}` : ""}`;
+    case "gap_detected":
+      return str(p.message);
+    case "gap_resolved":
+      return str(p.message) || "Gap resolved";
+    case "tool":
+      return `${str(p.tool)} ${str(p.action)}${p.status ? ` — ${str(p.status)}` : ""}`;
+    case "spoken_summary":
+      return str(p.script);
+    case "summary":
+      return str(p.markdown);
+    case "system":
+      return str(p.message);
+    default:
+      return event.payload ? JSON.stringify(event.payload).slice(0, 100) : "";
+  }
+}
+
 export function TimelineItem({ event, isLast }: { event: TimelineEvent; isLast: boolean }) {
-  const payloadStr = event.payload ? JSON.stringify(event.payload).slice(0, 100) : "";
+  const payloadStr = formatEventText(event).slice(0, 140);
   const time = event.createdAt
     ? new Date(event.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
     : "";

@@ -587,6 +587,32 @@ async def _append_timeline(
     return ev
 
 
+def _format_event_text(ev: dict[str, Any]) -> str:
+    p = ev.get("payload") or {}
+    t = ev.get("type")
+    if t == "transcript":
+        return f"{p.get('speakerName') or 'Someone'}: {p.get('text', '')}"
+    if t in ("fact_created", "fact_updated", "hypothesis_created", "hypothesis_updated", "decision"):
+        statement = p.get("statement", "")
+        status = p.get("status")
+        return f"{statement} ({status})" if status else statement
+    if t == "action_created":
+        return p.get("title", "")
+    if t == "action_updated":
+        title, status = p.get("title", ""), p.get("status")
+        return f"{title} → {status}" if status else title
+    if t in ("gap_detected", "gap_resolved", "system"):
+        return p.get("message", "")
+    if t == "tool":
+        tool, action, status = p.get("tool", ""), p.get("action", ""), p.get("status")
+        return f"{tool} {action} — {status}" if status else f"{tool} {action}"
+    if t == "spoken_summary":
+        return p.get("script", "")
+    if t == "summary":
+        return p.get("markdown", "")
+    return json.dumps(p)[:120]
+
+
 # ---------------------------------------------------------------------------
 # WS broadcast
 # ---------------------------------------------------------------------------
@@ -1642,7 +1668,7 @@ async def generate_summary(incident_id: str, session: AsyncSession = Depends(get
         lines.append("")
     lines.append("## Timeline (key events)")
     for ev in timeline[-20:]:
-        lines.append(f"- [{ev['type']}] seq={ev['seq']} {json.dumps(ev['payload'])[:120]}")
+        lines.append(f"- [{ev['type']}] seq={ev['seq']} {_format_event_text(ev)[:120]}")
     lines.append("")
     lines.append("## Facts")
     if facts:
