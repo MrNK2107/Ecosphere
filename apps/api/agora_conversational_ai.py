@@ -54,8 +54,11 @@ AGORA_CUSTOMER_ID = os.getenv("AGORA_CUSTOMER_ID", "")
 AGORA_CUSTOMER_SECRET = os.getenv("AGORA_CUSTOMER_SECRET", "")
 AGORA_AREA = os.getenv("AGORA_AREA", "US")  # US | EU | AP | CN — see agent-quickstart-nextjs
 AGORA_CAI_LLM_MODE = os.getenv("AGORA_CAI_LLM_MODE", "custom")
-# Base URL only (no /chat/completions suffix) — matches OpenAI(base_url=...) semantics, e.g.
-# https://your-tunnel.ngrok.io/agora — the SDK/Agora will POST base_url + "/chat/completions".
+# Full path INCLUDING /chat/completions, e.g. https://your-tunnel.ngrok.io/agora/llm/chat/completions.
+# CORRECTED 2026-09-06: this used to be documented as "base URL only, Agora appends
+# /chat/completions" (matching plain OpenAI(base_url=...) client semantics) — that was an
+# untested assumption. Live traffic showed Agora POSTs to exactly the configured URL with no
+# suffix appended; every real request 404'd until AGORA_CUSTOM_LLM_URL was set to the full path.
 AGORA_CUSTOM_LLM_URL = os.getenv("AGORA_CUSTOM_LLM_URL", "")
 AGORA_CUSTOM_LLM_SHARED_SECRET = os.getenv("AGORA_CUSTOM_LLM_SHARED_SECRET", "echosphere-internal")
 

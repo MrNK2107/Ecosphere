@@ -8,7 +8,7 @@ import AgoraRTC, {
   useRemoteAudioTracks,
   useAutoPlayAudioTrack,
 } from "agora-rtc-react";
-import { ConversationalAIProvider, useTranscript, useAgentState } from "agora-agent-client-toolkit-react";
+import { ConversationalAIProvider, useTranscript, useAgentState, useAgentError } from "agora-agent-client-toolkit-react";
 import { API } from "../store/incidentStore";
 import { showToast } from "./Toast";
 import type { VoiceSessionData } from "../lib/voice";
@@ -42,6 +42,7 @@ function VoiceSessionInner({ appId, channel, token, uid }: { appId: string; chan
 
   const transcript = useTranscript();
   const { agentState } = useAgentState();
+  const { error, clearError } = useAgentError();
 
   useEffect(() => {
     fetch(`${API}/incidents/${encodeURIComponent(channel)}/agora-agent/join`, {
@@ -65,8 +66,17 @@ function VoiceSessionInner({ appId, channel, token, uid }: { appId: string; chan
         <span className="text-xs font-semibold text-slate-700">Live Voice</span>
         <span className="text-[10px] text-slate-400 capitalize">{agentState ?? "connecting…"}</span>
       </div>
+      {error && (
+        <div
+          className="px-3 py-2 bg-red-50 border-b border-red-100 text-xs text-red-700 cursor-pointer"
+          onClick={clearError}
+          title="Click to dismiss"
+        >
+          ⚠️ {error.error.message}
+        </div>
+      )}
       <div className="max-h-72 overflow-y-auto p-3 space-y-2">
-        {transcript.length === 0 && <p className="text-xs text-slate-400">Listening — say something…</p>}
+        {transcript.length === 0 && !error && <p className="text-xs text-slate-400">Listening — say something…</p>}
         {transcript.map((t) => (
           <div key={`${t.uid}-${t.turn_id}`} className="text-xs leading-snug">
             <span className="font-medium text-slate-600">{t.uid === AGENT_RTC_UID ? "EchoSphere" : "You"}: </span>
