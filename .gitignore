@@ -17,6 +17,7 @@ demo_run.db
 # env
 .env
 .env.local
+agora-restful-key-*.txt
 
 # os
 .DS_Store
