@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useIncidentStore, type Snapshot } from "../store/incidentStore";
 import { Avatar, Badge, Dot, type Tone } from "./ui";
 import { useElapsed } from "../lib/utils";
+import { useVoiceRoom } from "../lib/voice";
 
 const severityTone: Record<string, Tone> = {
   SEV1: "red", SEV2: "orange", SEV3: "amber", SEV4: "neutral",
@@ -12,6 +13,7 @@ export function Header({ snapshot }: { snapshot: Snapshot | null }) {
   const [inputId, setInputId] = useState(incidentId ?? "payment-001");
   const duration = useElapsed(snapshot?.incident?.createdAt);
   const participants = snapshot?.incident?.participants ?? [];
+  const voice = useVoiceRoom(incidentId);
 
   return (
     <div className="px-5 py-3 bg-white border-b border-slate-200 flex items-center gap-4">
@@ -61,6 +63,28 @@ export function Header({ snapshot }: { snapshot: Snapshot | null }) {
           Connect
         </button>
       </div>
+
+      {incidentId && (
+        <div className="flex items-center gap-2 border-l border-slate-200 pl-4">
+          {voice.state === "connected" && (
+            <Dot tone={voice.agentSpeaking ? "green" : "neutral"} pulse={voice.agentSpeaking} />
+          )}
+          <button
+            onClick={() => (voice.state === "connected" ? voice.leave() : voice.join())}
+            disabled={voice.state === "connecting" || voice.state === "leaving"}
+            className={`text-[11px] px-2.5 py-1.5 rounded-md font-medium disabled:opacity-50 ${
+              voice.state === "connected"
+                ? "bg-red-50 text-red-700 hover:bg-red-100"
+                : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+            }`}
+          >
+            {voice.state === "idle" && "🎙️ Join Voice"}
+            {voice.state === "connecting" && "Connecting…"}
+            {voice.state === "connected" && "🎙️ Leave Voice"}
+            {voice.state === "leaving" && "Leaving…"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

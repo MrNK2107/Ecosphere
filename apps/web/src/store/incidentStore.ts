@@ -75,7 +75,7 @@ interface IncidentState {
   setSpeaking: (v: boolean) => void;
 }
 
-const API = (() => {
+export const API = (() => {
   const env = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_URL;
   if (env) return env.replace(/\/$/, "");
   if (typeof window !== "undefined" && window.location.port === "5173") return "/api";
