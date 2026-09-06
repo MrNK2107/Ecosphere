@@ -3,6 +3,7 @@ import { useIncidentStore, type Snapshot } from "../store/incidentStore";
 import { Avatar, Badge, Dot, type Tone } from "./ui";
 import { useElapsed } from "../lib/utils";
 import { useVoiceRoom } from "../lib/voice";
+import { VoiceSession } from "./VoiceSession";
 
 const severityTone: Record<string, Tone> = {
   SEV1: "red", SEV2: "orange", SEV3: "amber", SEV4: "neutral",
@@ -16,7 +17,7 @@ export function Header({ snapshot }: { snapshot: Snapshot | null }) {
   const voice = useVoiceRoom(incidentId);
 
   return (
-    <div className="px-5 py-3 bg-white border-b border-slate-200 flex items-center gap-4">
+    <div className="relative px-5 py-3 bg-white border-b border-slate-200 flex items-center gap-4">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <h2 className="text-base font-semibold text-slate-900 truncate">
@@ -66,9 +67,6 @@ export function Header({ snapshot }: { snapshot: Snapshot | null }) {
 
       {incidentId && (
         <div className="flex items-center gap-2 border-l border-slate-200 pl-4">
-          {voice.state === "connected" && (
-            <Dot tone={voice.agentSpeaking ? "green" : "neutral"} pulse={voice.agentSpeaking} />
-          )}
           <button
             onClick={() => (voice.state === "connected" ? voice.leave() : voice.join())}
             disabled={voice.state === "connecting" || voice.state === "leaving"}
@@ -85,6 +83,8 @@ export function Header({ snapshot }: { snapshot: Snapshot | null }) {
           </button>
         </div>
       )}
+
+      {voice.state === "connected" && voice.session && <VoiceSession {...voice.session} />}
     </div>
   );
 }

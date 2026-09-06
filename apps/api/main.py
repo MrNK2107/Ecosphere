@@ -1295,18 +1295,19 @@ _agora_agents: dict[str, str] = {}  # incidentId -> agent_id, in-process (single
 
 
 @app.get("/agora/rtc-token", tags=["agora"])
-async def agora_rtc_token(channel: str, uid: int = 0, role: str = "publisher", expire: int = 3600):
-    """RTC token for a human/browser client to join the same voice channel as the
-    Conversational AI agent — for manual live-voice testing, not used by the agent itself
-    (it mints its own token internally)."""
+async def agora_rtc_token(channel: str, uid: int = 0, expire: int = 3600):
+    """Combined RTC + RTM token for a human/browser client — joins the RTC voice channel AND
+    logs into the RTM channel of the same name to receive the Conversational AI agent's
+    transcript/state events (per the agora skill's agent-client-toolkit-react reference: 'RTM
+    channel name matches the RTC channel name', 'RTM login identity must match the RTM token
+    subject'). Not used by the agent itself — it mints its own token internally."""
     if not agora_conversational_ai.CAI_ENABLED:
         raise HTTPException(status_code=503, detail="Agora not configured (AGORA_APP_ID/AGORA_APP_CERT missing)")
-    from agora_agent import generate_rtc_token
-    rtc_role = 1 if role.lower() == "publisher" else 2
-    token = generate_rtc_token(
+    from agora_agent import generate_convo_ai_token
+    token = generate_convo_ai_token(
         app_id=agora_conversational_ai.AGORA_APP_ID,
         app_certificate=agora_conversational_ai.AGORA_APP_CERT,
-        channel=channel, uid=uid, role=rtc_role, expiry_seconds=expire,
+        channel_name=channel, uid=uid, token_expire=expire,
     )
     return {"token": token, "appId": agora_conversational_ai.AGORA_APP_ID, "channel": channel, "uid": uid}
 
